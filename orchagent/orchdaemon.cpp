@@ -36,6 +36,7 @@ BufferOrch *gBufferOrch;
 SwitchOrch *gSwitchOrch;
 Directory<Orch*> gDirectory;
 NatOrch *gNatOrch;
+MonitorTxError *gMonitorTxError;
 
 bool gIsNatSupported = false;
 
@@ -219,6 +220,10 @@ bool OrchDaemon::init()
 
     gNatOrch = new NatOrch(m_applDb, m_stateDb, nat_tables, gRouteOrch, gNeighOrch);
 
+    TableConnector configDBConnector(m_configDb, CFG_TX_ERROR_TABLE_NAME);
+    TableConnector stateDBConnector(m_stateDb, STATE_TX_ERROR_TABLE_NAME);
+    gMonitorTxError = new MonitorTxError(configDBConnector, stateDBConnector);
+
     /*
      * The order of the orch list is important for state restore of warm start and
      * the queued processing in m_toSync map after gPortsOrch->allPortsReady() is set.
@@ -227,7 +232,9 @@ bool OrchDaemon::init()
      * when iterating ConsumerMap. This is ensured implicitly by the order of keys in ordered map.
      * For cases when Orch has to process tables in specific order, like PortsOrch during warm start, it has to override Orch::doTask()
      */
-    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gBufferOrch, gIntfsOrch, gNeighOrch, gRouteOrch, copp_orch, tunnel_decap_orch, qos_orch, wm_orch, policer_orch, sflow_orch, debug_counter_orch};
+    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gBufferOrch, gIntfsOrch, gNeighOrch, gRouteOrch, copp_orch,
+                   tunnel_decap_orch, qos_orch, wm_orch, policer_orch, sflow_orch, debug_counter_orch,
+                   gMonitorTxError };
 
     bool initialize_dtel = false;
     if (platform == BFN_PLATFORM_SUBSTRING || platform == VS_PLATFORM_SUBSTRING)
