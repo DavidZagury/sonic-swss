@@ -673,6 +673,7 @@ void PortsOrch::removeDefaultBridgePorts()
      * ports and one SAI_BRIDGE_PORT_TYPE_1Q_ROUTER port. The former type of
      * ports will be removed. */
     vector<sai_object_id_t> bridge_port_list(m_portCount + m_systemPortCount + 1);
+    vector<sai_object_id_t> bridge_ports_to_remove;
 
     sai_attribute_t attr;
     attr.id = SAI_BRIDGE_ATTR_PORT_LIST;
@@ -710,12 +711,35 @@ void PortsOrch::removeDefaultBridgePorts()
         }
         if (attr.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT)
         {
-            status = sai_bridge_api->remove_bridge_port(bridge_port_list[i]);
+            bridge_ports_to_remove.push_back(bridge_port_list[i]);
+
+            /* Disable MAC address learning on the bridge */
+            attr.id = SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE;
+            attr.value.s32 = SAI_BRIDGE_PORT_FDB_LEARNING_MODE_DISABLE;
+            status = sai_bridge_api->set_bridge_port_attribute(bridge_port_list[i], &attr);
             if (status != SAI_STATUS_SUCCESS)
             {
-                SWSS_LOG_ERROR("Failed to remove bridge port, rv:%d", status);
-                throw runtime_error("PortsOrch initialization failure");
+                SWSS_LOG_WARN("Failed to disable MAC learning on port, rv:%d", status);
             }
+        }
+    }
+
+    /* Flush FDB */
+    status = sai_fdb_api->flush_fdb_entries(gSwitchId, 0, NULL);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_WARN("Failed to flush FDB table");
+    }
+    sleep(5);
+
+    /* Now, we are safe to remove bridge ports*/
+    for (auto port : bridge_ports_to_remove)
+    {
+        status = sai_bridge_api->remove_bridge_port(port);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("Failed to remove bridge port, %" PRIx64 "rv:%d", port, status);
+            throw runtime_error("PortsOrch initialization failure");
         }
     }
 
