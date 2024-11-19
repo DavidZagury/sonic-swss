@@ -1235,6 +1235,14 @@ VxlanTunnelOrch::VxlanTunnelOrch(DBConnector *statedb, DBConnector *db, const st
 void VxlanTunnelOrch::doTask(SelectableTimer &timer)
 {
     SWSS_LOG_ENTER();
+    SWSS_LOG_INFO("DEDDY VxlanTunnelOrch::doTask");
+
+    std::map<std::string,std::string> mymap = {
+            { "alpha", "alpha" },
+            { "beta", "beta" } };
+
+    SWSS_LOG_INFO("DEDDY %s", mymap.at("alpha").c_str());
+    SWSS_LOG_INFO("DEDDY %s", mymap.at("gamma").c_str());
 
     for (auto it = m_pendingAddToFlexCntr.begin(); it != m_pendingAddToFlexCntr.end(); )
     {
