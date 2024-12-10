@@ -148,8 +148,10 @@ bool VlanMgr::addHostVlan(int vlan_id)
     res.clear();
     const std::string echo_cmd = std::string("")
       + ECHO_CMD + " 0 > /proc/sys/net/ipv4/conf/" + VLAN_PREFIX + std::to_string(vlan_id) + "/arp_evict_nocarrier";
-    swss::exec(echo_cmd, res);
 
+    SWSS_LOG_NOTICE("DEDDY vlanmgr Before addHostVlan");
+    swss::exec(echo_cmd, res);
+    SWSS_LOG_NOTICE("DEDDY vlanmgr After addHostVlan");
     return true;
 }
 
@@ -243,6 +245,8 @@ bool VlanMgr::addHostVlanMember(int vlan_id, const string &port_alias, const str
     cmds << BASH_CMD " -c " << shellquote(inner.str());
 
     std::string res;
+    SWSS_LOG_NOTICE("DEDDY vlanmgr Before vlan add member %s", inner.str());
+
     try
     {
         EXEC_WITH_ERROR_THROW(cmds.str(), res);
@@ -254,7 +258,7 @@ bool VlanMgr::addHostVlanMember(int vlan_id, const string &port_alias, const str
         else
             EXEC_WITH_ERROR_THROW(cmds.str(), res);
     }
-
+    SWSS_LOG_NOTICE("DEDDY vlanmgr After vlan add member");
     return true;
 }
 
