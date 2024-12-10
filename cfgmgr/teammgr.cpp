@@ -618,7 +618,7 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
 
     conf << "}}'";
 
-    SWSS_LOG_INFO("Port channel %s teamd configuration: %s",
+    SWSS_LOG_NOTICE("DEDDY Port channel %s teamd configuration: %s",
             alias.c_str(), conf.str().c_str());
 
     string warmstart_flag = WarmStart::isWarmStart() ? " -w -o" : " -r";
@@ -637,7 +637,7 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
         return task_need_retry;
     }
 
-    SWSS_LOG_NOTICE("Start port channel %s with teamd", alias.c_str());
+    SWSS_LOG_NOTICE("DEDDY Start port channel %s with teamd", alias.c_str());
 
     return task_success;
 }
@@ -755,6 +755,8 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
         << ",\"link_watch\": {\"name\": \"ethtool\"} }'; ";
     cmd << TEAMDCTL_CMD << " " << shellquote(lag) << " port add " << shellquote(member);
 
+    SWSS_LOG_NOTICE("DEDDY Start port channel add lag member %s to port channel %s with teamd", member.c_str(), lag.c_str());
+
     if (exec(cmd.str(), res) != 0)
     {
         // teamdctl port add command will fail when the member port is not
@@ -776,6 +778,9 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
             return task_failed;
         }
     }
+
+    SWSS_LOG_NOTICE("DEDDY Done port channel add lag member %s to port channel %s with teamd", member.c_str(), lag.c_str());
+
 
     vector<FieldValueTuple> fvs;
     m_cfgPortTable.get(member, fvs);
