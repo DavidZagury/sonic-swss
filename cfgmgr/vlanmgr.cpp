@@ -245,7 +245,7 @@ bool VlanMgr::addHostVlanMember(int vlan_id, const string &port_alias, const str
     cmds << BASH_CMD " -c " << shellquote(inner.str());
 
     std::string res;
-    SWSS_LOG_NOTICE("DEDDY vlanmgr Before vlan add member %s", inner.str());
+    SWSS_LOG_NOTICE("DEDDY vlanmgr Before vlan add member %s", inner.str().c_str());
 
     try
     {
