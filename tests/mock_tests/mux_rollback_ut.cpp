@@ -22,7 +22,7 @@ namespace mux_rollback_test
     DEFINE_SAI_API_MOCK(neighbor);
     DEFINE_SAI_API_MOCK(route);
     DEFINE_SAI_GENERIC_API_MOCK(acl, acl_entry);
-    DEFINE_SAI_GENERIC_API_OBJECT_BULK_MOCK(next_hop, next_hop);
+    DEFINE_SAI_GENERIC_API_MOCK(next_hop, next_hop);
     using ::testing::_;
     using namespace std;
     using namespace mock_orch_test;
@@ -37,8 +37,6 @@ namespace mux_rollback_test
     sai_bulk_remove_neighbor_entry_fn old_remove_neighbor_entries;
     sai_bulk_create_route_entry_fn old_create_route_entries;
     sai_bulk_remove_route_entry_fn old_remove_route_entries;
-    sai_bulk_object_create_fn old_object_create;
-    sai_bulk_object_remove_fn old_object_remove;
 
     class MuxRollbackTest : public MockOrchTest
     {
@@ -147,14 +145,10 @@ namespace mux_rollback_test
             MockSaiApis();
             old_create_neighbor_entries = gNeighOrch->gNeighBulker.create_entries;
             old_remove_neighbor_entries = gNeighOrch->gNeighBulker.remove_entries;
-            old_object_create = gNeighOrch->gNextHopBulker.create_entries;
-            old_object_remove = gNeighOrch->gNextHopBulker.remove_entries;
             old_create_route_entries = m_MuxCable->nbr_handler_->gRouteBulker.create_entries;
             old_remove_route_entries = m_MuxCable->nbr_handler_->gRouteBulker.remove_entries;
             gNeighOrch->gNeighBulker.create_entries = mock_create_neighbor_entries;
             gNeighOrch->gNeighBulker.remove_entries = mock_remove_neighbor_entries;
-            gNeighOrch->gNextHopBulker.create_entries = mock_create_next_hops;
-            gNeighOrch->gNextHopBulker.remove_entries = mock_remove_next_hops;
             m_MuxCable->nbr_handler_->gRouteBulker.create_entries = mock_create_route_entries;
             m_MuxCable->nbr_handler_->gRouteBulker.remove_entries = mock_remove_route_entries;
         }
@@ -164,8 +158,6 @@ namespace mux_rollback_test
             RestoreSaiApis();
             gNeighOrch->gNeighBulker.create_entries = old_create_neighbor_entries;
             gNeighOrch->gNeighBulker.remove_entries = old_remove_neighbor_entries;
-            gNeighOrch->gNextHopBulker.create_entries = old_object_create;
-            gNeighOrch->gNextHopBulker.remove_entries = old_object_remove;
             m_MuxCable->nbr_handler_->gRouteBulker.create_entries = old_create_route_entries;
             m_MuxCable->nbr_handler_->gRouteBulker.remove_entries = old_remove_route_entries;
         }
@@ -222,18 +214,16 @@ namespace mux_rollback_test
 
     TEST_F(MuxRollbackTest, StandbyToActiveNextHopAlreadyExists)
     {
-        std::vector<sai_status_t> exp_status{SAI_STATUS_ITEM_ALREADY_EXISTS};
-        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hops)
-            .WillOnce(DoAll(SetArrayArgument<6>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_ITEM_ALREADY_EXISTS)));
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
+            .WillOnce(Return(SAI_STATUS_ITEM_ALREADY_EXISTS));
         SetAndAssertMuxState(ACTIVE_STATE);
     }
 
     TEST_F(MuxRollbackTest, ActiveToStandbyNextHopNotFound)
     {
         SetAndAssertMuxState(ACTIVE_STATE);
-        std::vector<sai_status_t> exp_status{SAI_STATUS_ITEM_NOT_FOUND};
-        EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hops)
-            .WillOnce(DoAll(SetArrayArgument<3>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_ITEM_NOT_FOUND)));
+        EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hop)
+            .WillOnce(Return(SAI_STATUS_ITEM_NOT_FOUND));
         SetAndAssertMuxState(STANDBY_STATE);
     }
 
@@ -273,7 +263,7 @@ namespace mux_rollback_test
 
     TEST_F(MuxRollbackTest, StandbyToActiveExceptionRollbackToStandby)
     {
-        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hops)
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
             .WillOnce(Throw(exception()));
         SetMuxStateFromAppDb(ACTIVE_STATE);
         EXPECT_EQ(STANDBY_STATE, m_MuxCable->getState());
@@ -282,7 +272,7 @@ namespace mux_rollback_test
     TEST_F(MuxRollbackTest, ActiveToStandbyExceptionRollbackToActive)
     {
         SetAndAssertMuxState(ACTIVE_STATE);
-        EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hops)
+        EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hop)
             .WillOnce(Throw(exception()));
         SetMuxStateFromAppDb(STANDBY_STATE);
         EXPECT_EQ(ACTIVE_STATE, m_MuxCable->getState());
@@ -290,9 +280,8 @@ namespace mux_rollback_test
 
     TEST_F(MuxRollbackTest, StandbyToActiveNextHopTableFullRollbackToActive)
     {
-        std::vector<sai_status_t> exp_status{SAI_STATUS_TABLE_FULL};
-        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hops)
-            .WillOnce(DoAll(SetArrayArgument<6>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_TABLE_FULL)));
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
+            .WillOnce(Return(SAI_STATUS_TABLE_FULL));
         SetMuxStateFromAppDb(ACTIVE_STATE);
         EXPECT_EQ(STANDBY_STATE, m_MuxCable->getState());
     }

@@ -486,8 +486,7 @@ sai_object_id_t NextHopGroupMember::getNhId() const
      */
     else if (isLabeled() && gNeighOrch->isNeighborResolved(m_key))
     {
-        NeighborContext ctx = NeighborContext(m_key);
-        if (gNeighOrch->addNextHop(ctx))
+        if (gNeighOrch->addNextHop(m_key))
         {
             nh_id = gNeighOrch->getNextHopId(m_key);
         }
