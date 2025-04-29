@@ -116,8 +116,7 @@ orchagent_SOURCES = \
             dash/dashaclgroupmgr.cpp \
             dash/dashtagmgr.cpp \
             dash/pbutils.cpp \
-            twamporch.cpp
-            stporch.cpp \
+            twamporch.cpp \
             high_frequency_telemetry/hftelorch.cpp \
             high_frequency_telemetry/hftelprofile.cpp \
             high_frequency_telemetry/counternameupdater.cpp \
