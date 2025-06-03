@@ -651,9 +651,9 @@ void HFTelOrch::createTAM()
     attr.value.oid = m_sai_hostif_user_defined_trap_obj;
     attrs.push_back(attr);
 
-    attr.id = SAI_TAM_COLLECTOR_ATTR_DSCP_VALUE;
-    attr.value.u8 = 0;
-    attrs.push_back(attr);
+    // attr.id = SAI_TAM_COLLECTOR_ATTR_DSCP_VALUE;
+    // attr.value.u8 = 0;
+    // attrs.push_back(attr);
 
     handleSaiCreateStatus(
         SAI_API_TAM,
