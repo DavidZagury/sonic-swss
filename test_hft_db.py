@@ -98,7 +98,7 @@ class TestCalculator(unittest.TestCase):
 
 
         assert len(asic_db["tam"]) == 1, "Expected one tam"
-        assert "SAI_TAM_BIND_POINT_TYPE_PORT" in list(asic_db["tam"].values())[0]["SAI_TAM_ATTR_TAM_BIND_POINT_TYPE_LIST"], "Expected tam to have bind point type list"
+        assert "SAI_TAM_BIND_POINT_TYPE_SWITCH" in list(asic_db["tam"].values())[0]["SAI_TAM_ATTR_TAM_BIND_POINT_TYPE_LIST"], "Expected tam to have bind point type list"
 
         assert len(asic_db["tam_counter_subscription"]) == 1, "Expected one tam counter subscription"
         assert "ASIC_STATE:SAI_OBJECT_TYPE_TAM_TEL_TYPE:" + list(asic_db["tam_counter_subscription"].values())[0]["SAI_TAM_COUNTER_SUBSCRIPTION_ATTR_TEL_TYPE"] in asic_db["tam_tel_type"], "Expected tam counter subscription to reference tam telemetry"

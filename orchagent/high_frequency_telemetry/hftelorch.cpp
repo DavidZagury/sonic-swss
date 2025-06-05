@@ -667,8 +667,7 @@ void HFTelOrch::createTAM()
     attrs.clear();
     attr.id = SAI_TAM_ATTR_TAM_BIND_POINT_TYPE_LIST;
     vector<sai_int32_t> bind_point_types = {
-        SAI_TAM_BIND_POINT_TYPE_PORT,
-        SAI_TAM_BIND_POINT_TYPE_QUEUE,
+            SAI_TAM_BIND_POINT_TYPE_SWITCH,
     };
     attr.value.s32list.count = static_cast<uint32_t>(bind_point_types.size());
     attr.value.s32list.list = bind_point_types.data();
