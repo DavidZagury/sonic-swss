@@ -109,11 +109,11 @@ void HFTelOrch::locallyNotify(const CounterNameMapUpdater::Message &msg)
     auto counter_itr = HFTelOrch::SUPPORT_COUNTER_TABLES.find(msg.m_table_name);
     if (counter_itr == HFTelOrch::SUPPORT_COUNTER_TABLES.end())
     {
-        SWSS_LOG_WARN("The counter table %s is not supported by high frequency telemetry", msg.m_table_name);
+        SWSS_LOG_WARN("HFTLOG The counter table %s is not supported by high frequency telemetry", msg.m_table_name);
         return;
     }
 
-    SWSS_LOG_NOTICE("The counter table %s is updated, operation %d, object %s",
+    SWSS_LOG_NOTICE("HFTLOG The counter table %s is updated, operation %d, object %s",
                     msg.m_table_name,
                     msg.m_operation,
                     msg.m_operation == CounterNameMapUpdater::SET ? msg.m_set.m_counter_name : msg.m_del.m_counter_name);
@@ -144,7 +144,7 @@ void HFTelOrch::locallyNotify(const CounterNameMapUpdater::Message &msg)
             // TODO: Here is a potential issue, we might need to retry the task.
             // Because the Syncd is generating the configuration(template),
             // we cannot update the monitor objects at this time.
-            SWSS_LOG_WARN("The high frequency telemetry profile %s is not ready to be updated, but the object %s want to be updated", profile->getProfileName().c_str(), counter_name);
+            SWSS_LOG_WARN("HFTLOG The high frequency telemetry profile %s is not ready to be updated, but the object %s want to be updated", profile->getProfileName().c_str(), counter_name);
             continue;
         }
 
@@ -204,7 +204,7 @@ task_process_status HFTelOrch::profileTableSet(const string &profile_name, const
         profile->setPollInterval(poll_interval);
     }
 
-    SWSS_LOG_NOTICE("The high frequency telemetry profile %s is set (stream_state: %s, poll_interval: %u)",
+    SWSS_LOG_NOTICE("HFTLOG The high frequency telemetry profile %s is set (stream_state: %s, poll_interval: %u)",
                     profile_name.c_str(),
                     state == SAI_TAM_TEL_TYPE_STATE_START_STREAM ? "enable" : "disable",
                     poll_interval);
@@ -234,7 +234,7 @@ task_process_status HFTelOrch::profileTableDel(const std::string &profile_name)
 
     m_name_profile_mapping.erase(profile_itr);
 
-    SWSS_LOG_NOTICE("The high frequency telemetry profile %s is deleted", profile_name.c_str());
+    SWSS_LOG_NOTICE("HFTLOG The high frequency telemetry profile %s is deleted", profile_name.c_str());
 
     return task_process_status::task_success;
 }
@@ -276,9 +276,9 @@ task_process_status HFTelOrch::groupTableSet(const std::string &profile_name, co
 
     if (profile->getStreamState(type) != SAI_TAM_TEL_TYPE_STATE_STOP_STREAM)
     {
-        SWSS_LOG_WARN("The high frequency telemetry group %s:%s is not in the stop stream state, it means no new configuration needs to be applied",
-                    profile_name.c_str(),
-                    group_name.c_str());
+        SWSS_LOG_WARN("HFTLOG The high frequency telemetry group %s:%s is not in the stop stream state, it means no new configuration needs to be applied",
+                      profile_name.c_str(),
+                      group_name.c_str());
         return task_process_status::task_success;
     }
 
@@ -286,7 +286,7 @@ task_process_status HFTelOrch::groupTableSet(const std::string &profile_name, co
 
     m_type_profile_mapping[type].insert(profile);
 
-    SWSS_LOG_NOTICE("The high frequency telemetry group %s with profile %s is set (object_names: %s, object_counters: %s)",
+    SWSS_LOG_NOTICE("HFTLOG The high frequency telemetry group %s with profile %s is set (object_names: %s, object_counters: %s)",
                     group_name.c_str(),
                     profile_name.c_str(),
                     arg_object_names ? arg_object_names->c_str() : "",
@@ -303,7 +303,7 @@ task_process_status HFTelOrch::groupTableDel(const std::string &profile_name, co
 
     if (!profile)
     {
-        SWSS_LOG_WARN("The high frequency telemetry profile %s is not found", profile_name.c_str());
+        SWSS_LOG_WARN("HFTLOG The high frequency telemetry profile %s is not found", profile_name.c_str());
         return task_process_status::task_success;
     }
 
@@ -318,7 +318,7 @@ task_process_status HFTelOrch::groupTableDel(const std::string &profile_name, co
     m_type_profile_mapping[type].erase(profile);
     m_state_telemetry_session.del(profile_name + "|" + group_name);
 
-    SWSS_LOG_NOTICE("The high frequency telemetry group %s with profile %s is deleted", group_name.c_str(), profile_name.c_str());
+    SWSS_LOG_NOTICE("HFTLOG The high frequency telemetry group %s with profile %s is deleted", group_name.c_str(), profile_name.c_str());
 
     return task_process_status::task_success;
 }
@@ -357,14 +357,13 @@ std::shared_ptr<HFTelProfile> HFTelOrch::tryGetProfile(const std::string &profil
 void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
 {
     SWSS_LOG_ENTER();
-
     std::string op;
     std::string data;
     std::vector<swss::FieldValueTuple> values;
 
     if (&consumer != m_asic_notification_consumer.get())
     {
-        SWSS_LOG_DEBUG("Is not TAM notification");
+        SWSS_LOG_NOTICE("HFTLOG Is not TAM notification");
         return;
     }
 
@@ -372,7 +371,7 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
 
     if (&consumer != m_asic_notification_consumer.get())
     {
-        SWSS_LOG_ERROR("Unknown consumer");
+        SWSS_LOG_ERROR("HFTLOG Unknown consumer");
         return;
     }
 
@@ -382,18 +381,20 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
         return;
     }
 
+    SWSS_LOG_NOTICE("HFTLOG Do NotificationConsumer task");
     sai_object_id_t tam_tel_type_obj = SAI_NULL_OBJECT_ID;
 
     sai_deserialize_object_id(data, tam_tel_type_obj);
 
     if (tam_tel_type_obj == SAI_NULL_OBJECT_ID)
     {
-        SWSS_LOG_ERROR("The TAM tel type object is not valid");
+        SWSS_LOG_ERROR("HFTLOG The TAM tel type object is not valid");
         return;
     }
 
     for (auto &profile : m_name_profile_mapping)
     {
+        SWSS_LOG_WARN("HFTLOG The profile %s is checking the TAM tel type object %s", profile.first.c_str(), sai_serialize_object_id(tam_tel_type_obj).c_str());
         auto type = profile.second->getObjectType(tam_tel_type_obj);
         if (type == SAI_OBJECT_TYPE_NULL)
         {
@@ -423,7 +424,7 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
 
         values.emplace_back("object_names", boost::algorithm::join(profile.second->getObjectNames(type), ","));
         auto to_string = boost::adaptors::transformed([](sai_uint16_t n)
-                                                        { return boost::lexical_cast<std::string>(n); });
+                                                      { return boost::lexical_cast<std::string>(n); });
         values.emplace_back("object_ids", boost::algorithm::join(profile.second->getObjectLabels(type) | to_string, ","));
 
 
@@ -434,20 +435,20 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
 
         m_state_telemetry_session.set(profile.first + "|" + HFTelUtils::sai_type_to_group_name(type), values);
 
-        SWSS_LOG_NOTICE("The high frequency telemetry group %s with profile %s is ready",
+        SWSS_LOG_NOTICE("HFTLOG The high frequency telemetry group %s with profile %s is ready",
                         HFTelUtils::sai_type_to_group_name(type).c_str(),
                         profile.first.c_str());
 
         return;
     }
 
-    SWSS_LOG_ERROR("The TAM tel type object %s is not found in the profile", sai_serialize_object_id(tam_tel_type_obj).c_str());
+    SWSS_LOG_ERROR("HFTLOG The TAM tel type object %s is not found in the profile", sai_serialize_object_id(tam_tel_type_obj).c_str());
 }
 
 void HFTelOrch::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
-
+    SWSS_LOG_NOTICE("HFTLOG Do Consumer task");
     string table_name = consumer.getTableName();
 
     auto itr = consumer.m_toSync.begin();
@@ -471,7 +472,7 @@ void HFTelOrch::doTask(Consumer &consumer)
             }
             else
             {
-                SWSS_LOG_ERROR("Unknown operation type %s\n", op.c_str());
+                SWSS_LOG_ERROR("HFTLOG Unknown operation type %s\n", op.c_str());
             }
         }
         else if (table_name == CFG_HIGH_FREQUENCY_TELEMETRY_GROUP_TABLE_NAME)
@@ -491,12 +492,12 @@ void HFTelOrch::doTask(Consumer &consumer)
             }
             else
             {
-                SWSS_LOG_ERROR("Unknown operation type %s\n", op.c_str());
+                SWSS_LOG_ERROR("HFTLOG Unknown operation type %s\n", op.c_str());
             }
         }
         else
         {
-            SWSS_LOG_ERROR("Unknown table %s\n", table_name.c_str());
+            SWSS_LOG_ERROR("HFTLOG Unknown table %s\n", table_name.c_str());
         }
 
         if (status == task_process_status::task_need_retry)
@@ -513,6 +514,7 @@ void HFTelOrch::doTask(Consumer &consumer)
 void HFTelOrch::createNetlinkChannel(const string &genl_family, const string &genl_group)
 {
     SWSS_LOG_ENTER();
+    SWSS_LOG_NOTICE("HFTLOG Create netlink channel %s %s", genl_family.c_str(), genl_group.c_str());
 
     // Delete the existing netlink channel
     deleteNetlinkChannel();
@@ -552,6 +554,8 @@ void HFTelOrch::createNetlinkChannel(const string &genl_family, const string &ge
     attr.id = SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TRAP_GROUP;
     attr.value.oid = m_sai_hostif_trap_group_obj;
     attrs.push_back(attr);
+
+    SWSS_LOG_NOTICE("HFTLOG Create hostif user defined trap object ");
 
     sai_hostif_api->create_hostif_user_defined_trap(&m_sai_hostif_user_defined_trap_obj, gSwitchId, static_cast<uint32_t>(attrs.size()), attrs.data());
 
@@ -714,15 +718,15 @@ void HFTelOrch::deleteTAM()
     if (m_sai_tam_collector_obj != SAI_NULL_OBJECT_ID)
     {
         handleSaiRemoveStatus(
-            SAI_API_TAM,
-            sai_tam_api->remove_tam_collector(m_sai_tam_collector_obj));
+                SAI_API_TAM,
+                sai_tam_api->remove_tam_collector(m_sai_tam_collector_obj));
         m_sai_tam_collector_obj = SAI_NULL_OBJECT_ID;
     }
     if (m_sai_tam_transport_obj != SAI_NULL_OBJECT_ID)
     {
         handleSaiRemoveStatus(
-            SAI_API_TAM,
-            sai_tam_api->remove_tam_transport(m_sai_tam_transport_obj));
+                SAI_API_TAM,
+                sai_tam_api->remove_tam_transport(m_sai_tam_transport_obj));
         m_sai_tam_transport_obj = SAI_NULL_OBJECT_ID;
     }
 }
