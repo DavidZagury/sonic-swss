@@ -101,8 +101,8 @@ def check_asic_db(groups=[(1,1)]):
         assert list(asic_db["tam_report"].values())[i]["SAI_TAM_REPORT_ATTR_REPORT_INTERVAL"] == "300", "Expected tam report report interval to be 300"
 
 
-    assert len(asic_db["tam"]) == 1, "Expected one tam"
-    assert "SAI_TAM_BIND_POINT_TYPE_PORT" in list(asic_db["tam"].values())[0]["SAI_TAM_ATTR_TAM_BIND_POINT_TYPE_LIST"], "Expected tam to have bind point type list"
+        assert len(asic_db["tam"]) == 1, "Expected one tam"
+        assert "SAI_TAM_BIND_POINT_TYPE_SWITCH" in list(asic_db["tam"].values())[0]["SAI_TAM_ATTR_TAM_BIND_POINT_TYPE_LIST"], "Expected tam to have bind point type list"
 
     counters_number = sum([group[0] * group[1] for group in groups])
 
