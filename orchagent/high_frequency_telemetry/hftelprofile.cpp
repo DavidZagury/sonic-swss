@@ -766,6 +766,20 @@ sai_object_id_t HFTelProfile::getTAMTelTypeObjID(sai_object_type_t object_type)
         tam,
         tam_telemetry);
 
+    // Create TAM object
+    attrs.clear();
+    attr.id = SAI_TAM_ATTR_TELEMETRY_OBJECTS_LIST;
+    attr.value.objlist.count = 1;
+    attr.value.objlist.list = &sai_object;
+
+    attrs.push_back(attr);
+
+    handleSaiSetStatus(
+    SAI_API_TAM,
+    sai_tam_api->set_tam_attribute(
+        m_sai_tam_obj,
+        attrs.data()));
+
     return sai_object;
 }
 
