@@ -42,6 +42,7 @@ public:
     string getRifRateFlexCounterTableKey(string key);
     void increaseRouterIntfsRefCount(const string&);
     void decreaseRouterIntfsRefCount(const string&);
+    void dumpInterfaceRefCounts();
 
     bool setRouterIntfsMtu(const Port &port);
     bool setRouterIntfsMac(const Port &port);
@@ -92,6 +93,7 @@ private:
     unique_ptr<Table> m_vidToRidTable;
 
     std::set<std::string> m_removingIntfses;
+    std::map<std::string, int> m_removalAttempts;
 
     std::string getRifFlexCounterTableKey(std::string s);
 

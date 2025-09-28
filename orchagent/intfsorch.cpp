@@ -192,6 +192,44 @@ void IntfsOrch::decreaseRouterIntfsRefCount(const string &alias)
                   alias.c_str(), m_syncdIntfses[alias].ref_count);
 }
 
+void IntfsOrch::dumpInterfaceRefCounts()
+{
+    SWSS_LOG_ENTER();
+    
+    SWSS_LOG_NOTICE("=== Interface Reference Count Debug Dump ===");
+    
+    if (m_syncdIntfses.empty())
+    {
+        SWSS_LOG_NOTICE("No interfaces found in m_syncdIntfses");
+        return;
+    }
+    
+    for (const auto &intf : m_syncdIntfses)
+    {
+        const string &alias = intf.first;
+        const IntfsEntry &entry = intf.second;
+        
+        SWSS_LOG_NOTICE("Interface: %s", alias.c_str());
+        SWSS_LOG_NOTICE("  - Ref Count: %d", entry.ref_count);
+        SWSS_LOG_NOTICE("  - VRF ID: %lu", entry.vrf_id);
+        SWSS_LOG_NOTICE("  - Proxy ARP: %s", entry.proxy_arp ? "enabled" : "disabled");
+        SWSS_LOG_NOTICE("  - IP Addresses (%zu):", entry.ip_addresses.size());
+        
+        for (const auto &ip : entry.ip_addresses)
+        {
+            SWSS_LOG_NOTICE("    - %s", ip.to_string().c_str());
+        }
+        
+        if (entry.ref_count > 0)
+        {
+            SWSS_LOG_NOTICE("  * WARNING: Interface %s has non-zero ref count %d", 
+                           alias.c_str(), entry.ref_count);
+        }
+    }
+    
+    SWSS_LOG_NOTICE("=== End Interface Reference Count Debug Dump ===");
+}
+
 bool IntfsOrch::setRouterIntfsMpls(const Port &port)
 {
     SWSS_LOG_ENTER();
@@ -1325,7 +1363,28 @@ bool IntfsOrch::removeRouterIntfs(Port &port)
 
     if (m_syncdIntfses[port.m_alias].ref_count > 0)
     {
-        SWSS_LOG_NOTICE("Router interface %s is still referenced with ref count %d", port.m_alias.c_str(), m_syncdIntfses[port.m_alias].ref_count);
+        SWSS_LOG_NOTICE("Router interface %s is still referenced with ref count %d. "
+                       "Check if there are active routes, neighbors, next-hop groups, or VNet routes using this interface. "
+                       "VRF ID: %lu, IP addresses count: %zu",
+                       port.m_alias.c_str(), m_syncdIntfses[port.m_alias].ref_count,
+                       m_syncdIntfses[port.m_alias].vrf_id,
+                       m_syncdIntfses[port.m_alias].ip_addresses.size());
+        
+        // Log associated IP addresses for additional context
+        for (const auto &ip : m_syncdIntfses[port.m_alias].ip_addresses)
+        {
+            SWSS_LOG_NOTICE("  - Interface %s has IP address: %s", port.m_alias.c_str(), ip.to_string().c_str());
+        }
+        
+        // Only dump interface reference counts if this interface has been stuck for multiple attempts
+        m_removalAttempts[port.m_alias]++;
+        
+        if (m_removalAttempts[port.m_alias] >= 3)
+        {
+            SWSS_LOG_NOTICE("Interface %s removal failed %d times, dumping debug info", 
+                           port.m_alias.c_str(), m_removalAttempts[port.m_alias]);
+            dumpInterfaceRefCounts();
+        }
         return false;
     }
 
@@ -1362,6 +1421,9 @@ bool IntfsOrch::removeRouterIntfs(Port &port)
     gPortsOrch->setPort(port.m_alias, port);
 
     SWSS_LOG_NOTICE("Remove router interface for port %s", port.m_alias.c_str());
+    
+    // Clear removal attempts counter since interface was successfully removed
+    m_removalAttempts.erase(port.m_alias);
 
     if(gMySwitchType == "voq")
     {
