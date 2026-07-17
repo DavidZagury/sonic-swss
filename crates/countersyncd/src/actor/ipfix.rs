@@ -721,6 +721,10 @@ impl IpfixActor {
         // is cheap (the cache is empty in the common path).
         self.invalidate_aggregated_lookup_cache();
 
+        // Reset the session's template_ids so a refresh with a different
+        // template_id doesn't leave the old one associated.
+        self.session_template_ids.remove(&templates.key);
+
         let cache_ref = Self::get_cache();
         let cache = cache_ref.borrow_mut();
         let mut read_size: usize = 0;
