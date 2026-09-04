@@ -1331,7 +1331,7 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
         addedPorts.emplace_back(cit.key, Port::PHY);
         auto& p = addedPorts.back();
 
-        p.m_role = cit.role.value;
+        p.m_role = cit.role.is_set ? cit.role.value : Port::Role::Ext;
         p.m_index = cit.index.value;
 
         if (cit.lanes.is_set)
@@ -4129,7 +4129,7 @@ bool PortsOrch::initExistingPort(const PortConfig& port)
     SWSS_LOG_ENTER();
 
     const auto &alias = port.key;
-    const auto &role = port.role.value;
+    const auto role = port.role.is_set ? port.role.value : Port::Role::Ext;
     const auto &index = port.index.value;
     const auto &lane_set = port.lanes.value;
 

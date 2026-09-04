@@ -1443,5 +1443,19 @@ bool PortHelper::validatePortConfig(PortConfig &port) const
         port.fieldValueMap[PORT_ADMIN_STATUS] = PORT_STATUS_DOWN;
     }
 
+    if (!port.role.is_set)
+    {
+        SWSS_LOG_INFO(
+            "Missing non mandatory field(%s): setting default value(%s)",
+            PORT_ROLE,
+            PORT_ROLE_EXT
+        );
+
+        port.role.value = Port::Role::Ext;
+        port.role.is_set = true;
+
+        port.fieldValueMap[PORT_ROLE] = PORT_ROLE_EXT;
+    }
+
     return true;
 }
