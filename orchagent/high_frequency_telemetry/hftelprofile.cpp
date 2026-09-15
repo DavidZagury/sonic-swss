@@ -57,6 +57,21 @@ const string &HFTelProfile::getProfileName() const
     return m_profile_name;
 }
 
+string HFTelProfile::getSessionKey(sai_object_type_t object_type) const
+{
+    return m_profile_name + "|" + (isMixedTypeMode() ? "MIXED" : HFTelUtils::sai_type_to_group_name(object_type));
+}
+
+void HFTelProfile::stopStreamForUpdate(sai_object_type_t object_type)
+{
+    setStreamState(object_type, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+    if (isMixedTypeMode())
+    {
+        // A later enable must not restart the shared stream with a stale template.
+        m_sai_tam_tel_type_templates.erase(mapKey(object_type));
+    }
+}
+
 void HFTelProfile::setStreamState(sai_tam_tel_type_state_t state)
 {
     SWSS_LOG_ENTER();
@@ -338,7 +353,7 @@ void HFTelProfile::setObjectNames(const string &group_name, set<string> &&object
     loadCounterNameCache(sai_object_type);
 
     // TODO: In the phase 2, we don't need to stop the stream before update the object names
-    setStreamState(sai_object_type, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+    stopStreamForUpdate(sai_object_type);
 }
 
 void HFTelProfile::setStatsIDs(const string &group_name, const set<string> &object_counters)
@@ -365,7 +380,7 @@ void HFTelProfile::setStatsIDs(const string &group_name, const set<string> &obje
     }
 
     // TODO: In the phase 2, we don't need to stop the stream before update the stats
-    setStreamState(sai_object_type, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+    stopStreamForUpdate(sai_object_type);
 
     deployCounterSubscriptions(sai_object_type);
 }
@@ -393,7 +408,7 @@ bool HFTelProfile::setObjectSAIID(sai_object_type_t object_type, const char *obj
     SWSS_LOG_DEBUG("Set object %s with ID %s in the name sai map", object_name, sai_serialize_object_id(object_id).c_str());
 
     // TODO: In the phase 2, we don't need to stop the stream before update the object
-    setStreamState(object_type, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+    stopStreamForUpdate(object_type);
 
     // Update the counter subscription
     deployCounterSubscriptions(object_type, object_id, m_groups.at(object_type).getObjects().at(object_name));
@@ -424,7 +439,7 @@ bool HFTelProfile::delObjectSAIID(sai_object_type_t object_type, const char *obj
     }
 
     // TODO: In the phase 2, we don't need to stop the stream before removing the object
-    setStreamState(object_type, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+    stopStreamForUpdate(object_type);
 
     // Remove all counters bounded to the object
     auto counter_itr = m_sai_tam_counter_subscription_objs.find(object_type);
@@ -491,6 +506,10 @@ void HFTelProfile::clearGroup(const std::string &group_name)
     auto itr = m_groups.find(sai_object_type);
     if (itr != m_groups.end())
     {
+        if (isMixedTypeMode())
+        {
+            stopStreamForUpdate(sai_object_type);
+        }
         for (const auto &obj : itr->second.getObjects())
         {
             delObjectSAIID(sai_object_type, obj.first.c_str());
@@ -566,6 +585,18 @@ const vector<uint16_t> HFTelProfile::getObjectLabels(sai_object_type_t object_ty
 pair<vector<string>, vector<string>> HFTelProfile::getObjectNamesAndLabels(sai_object_type_t object_type) const
 {
     SWSS_LOG_ENTER();
+
+    if (isMixedTypeMode())
+    {
+        pair<vector<string>, vector<string>> result;
+        for (const auto &group : m_groups)
+        {
+            auto names_and_labels = group.second.getObjectNamesAndLabels();
+            result.first.insert(result.first.end(), names_and_labels.first.begin(), names_and_labels.first.end());
+            result.second.insert(result.second.end(), names_and_labels.second.begin(), names_and_labels.second.end());
+        }
+        return result;
+    }
 
     auto group = m_groups.find(object_type);
     if (group == m_groups.end())

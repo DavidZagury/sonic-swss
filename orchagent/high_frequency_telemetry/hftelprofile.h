@@ -38,6 +38,7 @@ public:
     using sai_guard_t = std::shared_ptr<sai_object_id_t>;
 
     const std::string& getProfileName() const;
+    std::string getSessionKey(sai_object_type_t object_type) const;
     bool isMixedTypeMode() const { return m_tel_type_mode == SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE; }
     bool isCategorySupported(sai_object_type_t object_type) const
     {
@@ -64,6 +65,7 @@ public:
     const std::vector<std::uint8_t> &getTemplates(sai_object_type_t object_type) const;
     const std::vector<std::string> getObjectNames(sai_object_type_t object_type) const;
     const std::vector<std::uint16_t> getObjectLabels(sai_object_type_t object_type) const;
+    // Paired metadata for the hardware stream: all groups in MIXED, one in SINGLE.
     std::pair<std::vector<std::string>, std::vector<std::string>> getObjectNamesAndLabels(sai_object_type_t object_type) const;
     std::vector<sai_object_type_t> getObjectTypes() const;
 
@@ -123,6 +125,7 @@ private:
     bool isObjectTypeInProfile(sai_object_type_t object_type, const std::string &object_name) const;
     bool isMonitoringObjectReady(sai_object_type_t object_type) const;
     bool areAllMonitoringObjectsReady() const;
+    void stopStreamForUpdate(sai_object_type_t object_type);
 
     // In MIXED mode the per-profile sai_tam_tel_type / sai_tam_report /
     // IPFIX template are shared across object types, so they live in the

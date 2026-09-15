@@ -1,6 +1,7 @@
 import time
 
 from swsscommon import swsscommon
+from dvslib.dvs_common import wait_for_result
 
 
 class TestHFT(object):
@@ -139,6 +140,50 @@ class TestHFT(object):
             if status:
                 entries[key] = dict(fvs)
         return entries
+
+    def wait_for_hft_session(self, dvs, key, groups, stream_status="enabled"):
+        """Wait for a complete session and check name/label pairs against ASIC subscriptions."""
+        state_db = dvs.get_state_db()
+        table = "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE"
+        expected_names = {name for names in groups.values() for name in names}
+
+        def session_ready():
+            entry = state_db.get_entry(table, key)
+            return (
+                entry.get("stream_status") == stream_status
+                and entry.get("session_type") == "ipfix"
+                and bool(entry.get("session_config"))
+                and set(entry.get("object_names", "").split(",")) == expected_names,
+                entry,
+            )
+
+        _, entry = wait_for_result(session_ready)
+        names = entry["object_names"].split(",")
+        labels = entry.get("object_ids", "").split(",")
+        assert len(names) == len(expected_names), f"Duplicate object names in {key}: {entry}"
+        assert len(labels) == len(names), f"Unpaired names/labels in {key}: {entry}"
+        assert len(set(labels)) == len(labels), f"Duplicate labels in {key}: {entry}"
+
+        subscriptions = self.get_asic_db_objects(dvs)["tam_counter_subscription"]
+        expected_pairs = {}
+        for group, object_names in groups.items():
+            name_map = dvs.get_counters_db().wait_for_fields(
+                f"COUNTERS_{group}_NAME_MAP", "",
+                [name.replace("|", ":") for name in object_names],
+            )
+            for name in object_names:
+                oid = name_map[name.replace("|", ":")]
+                object_labels = {
+                    sub["SAI_TAM_COUNTER_SUBSCRIPTION_ATTR_LABEL"]
+                    for sub in subscriptions.values()
+                    if sub["SAI_TAM_COUNTER_SUBSCRIPTION_ATTR_OBJECT_ID"] == oid
+                }
+                assert len(object_labels) == 1, f"Expected one ASIC label for {name}: {object_labels}"
+                expected_pairs[name] = object_labels.pop()
+        assert dict(zip(names, labels)) == expected_pairs, (
+            f"Session {key} names/labels do not match ASIC subscriptions: {entry}, {expected_pairs}"
+        )
+        return entry
 
     def verify_asic_db_objects(self, asic_db, groups=[(1, 1)], watermark_count=0,
                                expected_mode="SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE"):
@@ -471,11 +516,8 @@ class TestHFT(object):
         profile_name = "test"
         port_group_name = "PORT"
         buffer_pool_group_name = "BUFFER_POOL"
-        port_session_key = f"{profile_name}|{port_group_name}"
-        buffer_pool_session_key = f"{profile_name}|{buffer_pool_group_name}"
-
-        state_db = swsscommon.DBConnector(6, dvs.redis_sock, 0)
-        state_tbl = swsscommon.Table(state_db, "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE")
+        state_db = dvs.get_state_db()
+        state_table = "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE"
 
         # 1) Insert config with stream_state=disabled
         self.create_hft_profile(dvs, name=profile_name, status="disabled")
@@ -488,26 +530,36 @@ class TestHFT(object):
             object_counters="CURR_OCCUPANCY_BYTES",
         )
 
-        # Allow orchagent to create the state entry.
-        time.sleep(3)
-
-        # 2) Update profile stream_state=enabled
-        self.create_hft_profile(dvs, name=profile_name, status="enabled")
-        time.sleep(3)
-
-        # 3) Verify both state DB entries have stream_status=enabled
-        for session_key in [port_session_key, buffer_pool_session_key]:
-            status, fvs = state_tbl.get(session_key)
-            assert status, f"Expected STATE_DB entry to exist for {session_key}"
-            entry = dict(fvs)
-            assert entry.get("stream_status") == "enabled", (
-                f"Expected stream_status=enabled for {session_key}, got {entry.get('stream_status')} (entry={entry})"
+        try:
+            dvs.get_asic_db().wait_for_n_keys(
+                "ASIC_STATE:SAI_OBJECT_TYPE_TAM_COUNTER_SUBSCRIPTION", 2
             )
-
-        # Cleanup
-        self.delete_hft_group(dvs, profile_name=profile_name, group_name=port_group_name)
-        self.delete_hft_group(dvs, profile_name=profile_name, group_name=buffer_pool_group_name)
-        self.delete_hft_profile(dvs, name=profile_name)
+            tel_types = self.get_asic_db_objects(dvs)["tam_tel_type"]
+            mixed = any(t.get("SAI_TAM_TEL_TYPE_ATTR_MODE") ==
+                        "SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE" for t in tel_types.values())
+            groups = {port_group_name: ["Ethernet0"], buffer_pool_group_name: ["egress_lossless_pool"]}
+            sessions = {"MIXED": groups} if mixed else {group: {group: names} for group, names in groups.items()}
+            entries = {
+                f"{profile_name}|{owner}": self.wait_for_hft_session(
+                    dvs, f"{profile_name}|{owner}", objects, stream_status="disabled"
+                )
+                for owner, objects in sessions.items()
+            }
+            for stream_status in ("enabled", "disabled"):
+                self.create_hft_profile(dvs, name=profile_name, status=stream_status)
+                for key, entry in entries.items():
+                    state_db.wait_for_exact_match(
+                        state_table, key, dict(entry, stream_status=stream_status)
+                    )
+                assert {key for key in state_db.get_keys(state_table)
+                        if key.startswith(f"{profile_name}|")} == set(entries)
+        finally:
+            self.delete_hft_group(dvs, profile_name=profile_name, group_name=port_group_name)
+            self.delete_hft_group(dvs, profile_name=profile_name, group_name=buffer_pool_group_name)
+            self.delete_hft_profile(dvs, name=profile_name)
+            state_db.wait_for_deleted_keys(
+                state_table, [f"{profile_name}|{owner}" for owner in ("MIXED", port_group_name, buffer_pool_group_name)]
+            )
 
     def test_hft_empty_fields_with_disabled_status(self, dvs, testlog):
         """Test HFT with empty object_names and object_counters when profile is disabled."""
@@ -721,21 +773,17 @@ class TestHFT(object):
 
 
     def test_hft_per_group_session_config_populated(self, dvs, testlog):
-        """STATE_DB session_config must be non-empty for every per-group
-        HIGH_FREQUENCY_TELEMETRY_SESSION entry.
+        """Every hardware stream has one complete STATE_DB session owner.
 
-        Regression test for the per-group SESSION-writing path used by both
-        SINGLE and MIXED modes. In SINGLE mode each tel_type emits its own
-        IPFIX template; in MIXED mode the single tel_type's combined template
-        is replicated across per-group entries. Either way, every entry must
-        carry session_config so CounterSyncd can register the template.
+        SINGLE retains per-group entries; MIXED publishes one aggregate entry
+        with all object names and labels alongside the combined IPFIX template.
         """
         profile_name = "test"
         port_group = "PORT"
         buffer_pool_group = "BUFFER_POOL"
 
-        state_db = swsscommon.DBConnector(6, dvs.redis_sock, 0)
-        state_tbl = swsscommon.Table(state_db, "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE")
+        state_db = dvs.get_state_db()
+        state_table = "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE"
 
         self.create_hft_profile(dvs, name=profile_name, status="enabled")
         self.create_hft_group(
@@ -753,29 +801,31 @@ class TestHFT(object):
             object_counters="CURR_OCCUPANCY_BYTES",
         )
         try:
-            time.sleep(5)
-
-            for group_name in (port_group, buffer_pool_group):
-                key = f"{profile_name}|{group_name}"
-                status, fvs = state_tbl.get(key)
-                assert status, f"Expected STATE_DB entry for {key}"
-                entry = dict(fvs)
-                assert entry.get("session_type") == "ipfix", (
-                    f"Expected session_type=ipfix for {key}, got {entry.get('session_type')}"
-                )
-                assert entry.get("session_config", ""), (
-                    f"Expected non-empty session_config for {key}; entry={entry}"
-                )
-                assert entry.get("object_names", ""), (
-                    f"Expected non-empty object_names for {key}; entry={entry}"
-                )
-                assert entry.get("object_ids", ""), (
-                    f"Expected non-empty object_ids for {key}; entry={entry}"
-                )
+            dvs.get_asic_db().wait_for_n_keys(
+                "ASIC_STATE:SAI_OBJECT_TYPE_TAM_COUNTER_SUBSCRIPTION", 2
+            )
+            modes = {t.get("SAI_TAM_TEL_TYPE_ATTR_MODE")
+                     for t in self.get_asic_db_objects(dvs)["tam_tel_type"].values()}
+            assert modes in ({"SAI_TAM_TEL_TYPE_MODE_SINGLE_TYPE"},
+                             {"SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE"}), modes
+            groups = {port_group: ["Ethernet0"], buffer_pool_group: ["egress_lossless_pool"]}
+            if modes == {"SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE"}:
+                sessions = {"MIXED": groups}
+            else:
+                sessions = {group: {group: names} for group, names in groups.items()}
+            for owner, objects in sessions.items():
+                self.wait_for_hft_session(dvs, f"{profile_name}|{owner}", objects)
+            assert {key for key in state_db.get_keys(state_table)
+                    if key.startswith(f"{profile_name}|")} == {
+                        f"{profile_name}|{owner}" for owner in sessions
+                    }
         finally:
             self.delete_hft_group(dvs, profile_name=profile_name, group_name=port_group)
             self.delete_hft_group(dvs, profile_name=profile_name, group_name=buffer_pool_group)
             self.delete_hft_profile(dvs, name=profile_name)
+            state_db.wait_for_deleted_keys(
+                state_table, [f"{profile_name}|{owner}" for owner in ("MIXED", port_group, buffer_pool_group)]
+            )
 
     def test_hft_mixed_mode_single_tel_type(self, dvs, testlog):
         """MIXED-mode end-to-end DVS test.
@@ -783,8 +833,8 @@ class TestHFT(object):
         Verifies that on a SAI advertising SAI_TAM_TEL_TYPE_MODE_MIXED_TYPE
         the orchagent produces a single shared sai_tam_tel_type and
         sai_tam_report per profile (covering every configured object type),
-        and that the per-group HIGH_FREQUENCY_TELEMETRY_SESSION entries
-        carry the same combined IPFIX template buffer.
+        and that one profile|MIXED session owns the combined IPFIX template
+        and all object names/labels, without duplicate per-group entries.
 
         Requires saivs's MIXED-mode capability advertisement, which lands in
         nvidia-sonic/sonic-sairedis#81. Until that PR merges this test will
@@ -795,6 +845,10 @@ class TestHFT(object):
         profile_name = "test_mixed"
         port_group = "PORT"
         queue_group = "QUEUE"
+        state_db = dvs.get_state_db()
+        state_table = "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE"
+        session_key = f"{profile_name}|MIXED"
+        subscription_table = "ASIC_STATE:SAI_OBJECT_TYPE_TAM_COUNTER_SUBSCRIPTION"
 
         self.create_hft_profile(dvs, name=profile_name, status="enabled")
         self.create_hft_group(
@@ -812,7 +866,9 @@ class TestHFT(object):
             object_counters="BYTES",
         )
         try:
-            time.sleep(5)
+            dvs.get_asic_db().wait_for_n_keys(subscription_table, 2)
+            groups = {port_group: ["Ethernet0"], queue_group: ["Ethernet0|7"]}
+            self.wait_for_hft_session(dvs, session_key, groups)
             asic_db = self.get_asic_db_objects(dvs)
 
             # Exactly one sai_tam_tel_type with MODE=MIXED_TYPE and all three
@@ -843,10 +899,12 @@ class TestHFT(object):
                 f"Expected exactly one tam_report in MIXED mode, found "
                 f"{len(asic_db['tam_report'])}"
             )
+            report_oid = tel_type["SAI_TAM_TEL_TYPE_ATTR_REPORT_ID"]
+            assert report_oid in asic_db["tam_report"]
 
             # Every counter subscription references the single shared tel_type.
-            assert len(asic_db["tam_counter_subscription"]) >= 2, (
-                "Expected at least one subscription per group (PORT, QUEUE)"
+            assert len(asic_db["tam_counter_subscription"]) == 2, (
+                "Expected exactly one subscription per group (PORT, QUEUE)"
             )
             for sub_oid, sub in asic_db["tam_counter_subscription"].items():
                 assert sub["SAI_TAM_COUNTER_SUBSCRIPTION_ATTR_TEL_TYPE"] == \
@@ -856,30 +914,33 @@ class TestHFT(object):
                         f"expected the shared MIXED tel_type {tel_type_oid}"
                     )
 
-            # Per-group SESSION rows must carry identical session_config bytes
-            # (the orchagent replicates the combined IPFIX template buffer).
-            state_db = swsscommon.DBConnector(6, dvs.redis_sock, 0)
-            state_tbl = swsscommon.Table(
-                state_db, "HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE"
-            )
-            configs = {}
-            for grp in (port_group, queue_group):
-                key = f"{profile_name}|{grp}"
-                status, fvs = state_tbl.get(key)
-                assert status, f"Expected STATE_DB entry for {key}"
-                configs[grp] = dict(fvs).get("session_config", "")
-                assert configs[grp], (
-                    f"Expected non-empty session_config for {key}"
-                )
-            assert configs[port_group] == configs[queue_group], (
-                "Expected identical session_config bytes across per-group "
-                "SESSION entries in MIXED mode (orchagent replicates the "
-                "combined IPFIX template)"
-            )
+            assert {key for key in state_db.get_keys(state_table)
+                    if key.startswith(f"{profile_name}|")} == {session_key}
+
+            # Removing one group refreshes the shared owner with only surviving objects.
+            self.delete_hft_group(dvs, profile_name=profile_name, group_name=queue_group)
+            dvs.get_asic_db().wait_for_n_keys(subscription_table, 1)
+            self.wait_for_hft_session(dvs, session_key, {port_group: ["Ethernet0"]})
+            assert {key for key in state_db.get_keys(state_table)
+                    if key.startswith(f"{profile_name}|")} == {session_key}
+            remaining_asic = self.get_asic_db_objects(dvs)
+            assert set(remaining_asic["tam_tel_type"]) == {tel_type_oid}
+            assert set(remaining_asic["tam_report"]) == {report_oid}
+
+            # Removing the last group removes the owner, even while the profile exists.
+            self.delete_hft_group(dvs, profile_name=profile_name, group_name=port_group)
+            dvs.get_asic_db().wait_for_n_keys(subscription_table, 0)
+            state_db.wait_for_deleted_entry(state_table, session_key)
+            assert not any(key.startswith(f"{profile_name}|") for key in state_db.get_keys(state_table))
         finally:
             self.delete_hft_group(dvs, profile_name=profile_name, group_name=port_group)
             self.delete_hft_group(dvs, profile_name=profile_name, group_name=queue_group)
             self.delete_hft_profile(dvs, name=profile_name)
+            state_db.wait_for_deleted_keys(
+                state_table, [session_key, f"{profile_name}|{port_group}", f"{profile_name}|{queue_group}"]
+            )
+            dvs.get_asic_db().wait_for_n_keys("ASIC_STATE:SAI_OBJECT_TYPE_TAM_TEL_TYPE", 0)
+            dvs.get_asic_db().wait_for_n_keys("ASIC_STATE:SAI_OBJECT_TYPE_TAM_REPORT", 0)
 
 
 # Add Dummy always-pass test at end as workaroud

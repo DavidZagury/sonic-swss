@@ -1,12 +1,33 @@
 #include "mock_sai_capability_wrap.h"
+// Pre-include standard headers before exposing private members to the fixtures.
+#include <sstream>
+#include <memory>
+#include <functional>
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <set>
+#define private public
+#define protected public
+#include "high_frequency_telemetry/hftelorch.h"
+#undef protected
+#undef private
 #include "ut_helper.h"
 #include "mock_orchagent_main.h"
-#include "high_frequency_telemetry/hftelorch.h"
+#include "high_frequency_telemetry/hftelutils.h"
 #include "schema.h"
+#include "json.h"
+#include "notifications.h"
+#include "sai_serialize.h"
 #include <gtest/gtest.h>
-#include <memory>
 
 extern sai_switch_api_t *sai_switch_api;
+extern sai_tam_api_t *sai_tam_api;
+extern redisReply *mockReply;
 
 namespace hftelorch_test
 {
@@ -372,6 +393,361 @@ namespace hftelorch_test
 
         auto orch = make_unique<HFTelOrch>(m_config_db.get(), m_state_db.get(), stel_tables);
         orch.reset();
+    }
+
+    class HFTelSessionOwnerTest : public HFTelOrchShutdownTest
+    {
+    protected:
+        unique_ptr<HFTelOrch> orch;
+        shared_ptr<HFTelProfile> profile;
+        sai_tam_api_t tam_api{};
+        sai_tam_api_t *saved_tam_api = nullptr;
+        static vector<uint8_t> template_data;
+        static vector<pair<sai_object_id_t, int32_t>> transitions;
+        static sai_object_id_t next_counter;
+        const string name = "hft_owner_test";
+
+        void SetUp() override
+        {
+            HFTelOrchShutdownTest::SetUp();
+            saved_tam_api = sai_tam_api;
+            tam_api = *sai_tam_api;
+            tam_api.get_tam_tel_type_attribute = [](sai_object_id_t, uint32_t count, sai_attribute_t *attrs) -> sai_status_t {
+                if (count != 1 || attrs->id != SAI_TAM_TEL_TYPE_ATTR_IPFIX_TEMPLATES)
+                    return SAI_STATUS_INVALID_PARAMETER;
+                auto &list = attrs->value.u8list;
+                if (list.count < template_data.size())
+                {
+                    list.count = static_cast<uint32_t>(template_data.size());
+                    return SAI_STATUS_BUFFER_OVERFLOW;
+                }
+                copy(template_data.begin(), template_data.end(), list.list);
+                list.count = static_cast<uint32_t>(template_data.size());
+                return SAI_STATUS_SUCCESS;
+            };
+            tam_api.set_tam_tel_type_attribute = [](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t {
+                transitions.emplace_back(oid, attr->value.s32);
+                return SAI_STATUS_SUCCESS;
+            };
+            tam_api.create_tam_counter_subscription = [](sai_object_id_t *oid, sai_object_id_t,
+                                                        uint32_t, const sai_attribute_t *) -> sai_status_t {
+                *oid = ++next_counter;
+                return SAI_STATUS_SUCCESS;
+            };
+            tam_api.remove_tam_counter_subscription = [](sai_object_id_t) -> sai_status_t { return SAI_STATUS_SUCCESS; };
+            sai_tam_api = &tam_api;
+            transitions.clear();
+            template_data.clear();
+        }
+
+        void TearDown() override
+        {
+            profile.reset();
+            orch.reset();
+            sai_tam_api = saved_tam_api;
+            hftelorch_sai_wrap_ut::setSaiHookNone();
+            swss::Table table(m_state_db.get(), STATE_HIGH_FREQUENCY_TELEMETRY_SESSION_TABLE_NAME);
+            for (const auto &suffix : {"MIXED", "PORT", "QUEUE"})
+                table.del(name + "|" + suffix);
+            HFTelOrchShutdownTest::TearDown();
+        }
+
+        void createOrch(bool mixed = true)
+        {
+            hftelorch_sai_wrap_ut::setSaiHookAllSupported();
+            if (mixed)
+                hftelorch_sai_wrap_ut::setSaiHookModeAdvertisedMixedOnly();
+            else
+                hftelorch_sai_wrap_ut::setSaiHookModeAdvertisedSingleOnly();
+            orch = make_unique<HFTelOrch>(m_config_db.get(), m_state_db.get(), vector<string>{
+                CFG_HIGH_FREQUENCY_TELEMETRY_PROFILE_TABLE_NAME,
+                CFG_HIGH_FREQUENCY_TELEMETRY_GROUP_TABLE_NAME});
+            ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "enabled"}}), task_success);
+            profile = orch->tryGetProfile(name);
+            ASSERT_NE(profile, nullptr);
+            ASSERT_EQ(profile->isMixedTypeMode(), mixed);
+            // Keep hardware creation out of these producer tests; exercise the
+            // real profile/group lifecycle using tracked telemetry-type handles.
+            for (const auto type : {SAI_OBJECT_TYPE_PORT, SAI_OBJECT_TYPE_QUEUE})
+            {
+                const auto key = profile->mapKey(type);
+                if (profile->m_sai_tam_tel_type_objs.count(key))
+                    continue;
+                auto guard = make_shared<sai_object_id_t>(0x700 + key);
+                profile->m_sai_tam_tel_type_objs[key] = guard;
+                profile->m_sai_tam_tel_type_states[guard] = SAI_TAM_TEL_TYPE_STATE_STOP_STREAM;
+                profile->m_sai_tam_report_objs[key] = make_shared<sai_object_id_t>(0x800 + key);
+            }
+            orch->m_counter_name_cache[SAI_OBJECT_TYPE_PORT] = {{"Ethernet0", 0x101}, {"Ethernet4", 0x102}, {"Ethernet8", 0x103}};
+            orch->m_counter_name_cache[SAI_OBJECT_TYPE_QUEUE] = {{"Ethernet0|0", 0x201}, {"Ethernet4|0", 0x202}};
+        }
+
+        void setGroup(const string &group, const string &names)
+        {
+            const auto type = HFTelUtils::group_name_to_sai_type(group);
+            const auto stats = sai_metadata_get_object_type_info(type)->statenum;
+            const auto stat = type == SAI_OBJECT_TYPE_PORT
+                ? static_cast<sai_stat_id_t>(SAI_PORT_STAT_IF_IN_OCTETS)
+                : static_cast<sai_stat_id_t>(SAI_QUEUE_STAT_PACKETS);
+            string counter;
+            for (size_t i = 0; i < stats->valuescount; ++i)
+                if (stats->values[i] == stat)
+                    counter = stats->valuesshortnames[i];
+            ASSERT_FALSE(counter.empty());
+            ASSERT_EQ(orch->groupTableSet(name, group, {
+                {"object_names", names}, {"object_counters", counter}}), task_success);
+        }
+
+        void notify(sai_object_id_t oid)
+        {
+            const auto message = swss::JSon::buildJson({{
+                SAI_SWITCH_NOTIFICATION_NAME_TAM_TEL_TYPE_CONFIG_CHANGE, sai_serialize_object_id(oid)}});
+            redisReply payload{};
+            payload.type = REDIS_REPLY_STRING;
+            payload.str = const_cast<char *>(message.c_str());
+            payload.len = message.size();
+            redisReply *elements[] = {nullptr, nullptr, &payload};
+            redisReply reply{};
+            reply.type = REDIS_REPLY_ARRAY;
+            reply.elements = 3;
+            reply.element = elements;
+            mockReply = &reply;
+            orch->m_asic_notification_consumer->readData();
+            mockReply = nullptr;
+            orch->doTask(*orch->m_asic_notification_consumer);
+        }
+
+        void ready(sai_object_type_t type, uint16_t generation = 300)
+        {
+            template_data.clear();
+            // A complete binary IPFIX snapshot, one template per object, with
+            // embedded NULs and enterprise labels from the configured groups.
+            for (const auto &group : profile->m_groups)
+            {
+                if (!profile->isMixedTypeMode() && group.first != type)
+                    continue;
+                for (const auto &object : group.second.getObjects())
+                {
+                    const auto id = static_cast<uint16_t>(generation + object.second);
+                    vector<uint8_t> bytes = {
+                        0, 10, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                        0, 2, 0, 20, static_cast<uint8_t>(id >> 8), static_cast<uint8_t>(id),
+                        0, 2, 1, 69, 0, 8,
+                        static_cast<uint8_t>(0x80 | (object.second >> 8)), static_cast<uint8_t>(object.second), 0, 8,
+                        0, static_cast<uint8_t>(group.first), 0, static_cast<uint8_t>(*group.second.getStatsIDs().begin())};
+                    template_data.insert(template_data.end(), bytes.begin(), bytes.end());
+                }
+            }
+            notify(*profile->m_sai_tam_tel_type_objs.at(profile->mapKey(type)));
+        }
+
+        map<string, string> row(const string &suffix)
+        {
+            vector<swss::FieldValueTuple> values;
+            EXPECT_TRUE(orch->m_state_telemetry_session.get(name + "|" + suffix, values));
+            return {values.begin(), values.end()};
+        }
+
+        void expectKeys(const set<string> &suffixes)
+        {
+            vector<string> keys;
+            orch->m_state_telemetry_session.getKeys(keys);
+            set<string> actual;
+            for (const auto &key : keys)
+                if (key.compare(0, name.size() + 1, name + "|") == 0)
+                    actual.insert(key.substr(name.size() + 1));
+            EXPECT_EQ(actual, suffixes);
+        }
+
+        void expectSnapshot(const string &suffix, const string &status, const vector<sai_object_type_t> &types)
+        {
+            const auto values = row(suffix);
+            ASSERT_EQ(values.size(), 5u);
+            EXPECT_EQ(values.at("stream_status"), status);
+            EXPECT_EQ(values.at("session_type"), "ipfix");
+            EXPECT_EQ(values.at("session_config"), string(template_data.begin(), template_data.end()));
+            map<string, string> expected;
+            for (const auto type : types)
+                for (const auto &object : profile->m_groups.at(type).getObjects())
+                    EXPECT_TRUE(expected.emplace(to_string(object.second), object.first).second);
+            istringstream names(values.at("object_names")), ids(values.at("object_ids"));
+            string object_name, id;
+            map<string, string> actual;
+            while (getline(names, object_name, ','))
+            {
+                ASSERT_TRUE(static_cast<bool>(getline(ids, id, ',')));
+                EXPECT_TRUE(actual.emplace(id, object_name).second);
+            }
+            EXPECT_FALSE(static_cast<bool>(getline(ids, id, ',')));
+            EXPECT_EQ(actual, expected);
+        }
+
+        void twoGroups()
+        {
+            setGroup("PORT", "Ethernet0,Ethernet4");
+            ready(SAI_OBJECT_TYPE_PORT);
+            setGroup("QUEUE", "Ethernet0|0,Ethernet4|0");
+            ready(SAI_OBJECT_TYPE_QUEUE, 400);
+        }
+    };
+
+    vector<uint8_t> HFTelSessionOwnerTest::template_data;
+    vector<pair<sai_object_id_t, int32_t>> HFTelSessionOwnerTest::transitions;
+    sai_object_id_t HFTelSessionOwnerTest::next_counter = 0x900;
+
+    TEST_F(HFTelSessionOwnerTest, MixedPublishesCompleteSnapshotUnderOneStableOwner)
+    {
+        createOrch();
+        expectKeys({}); // Profile enable alone must not create a partial row.
+        setGroup("PORT", "Ethernet0,Ethernet4");
+        expectKeys({});
+        ready(SAI_OBJECT_TYPE_PORT);
+        const auto original = row("MIXED");
+        setGroup("QUEUE", "Ethernet0|0,Ethernet4|0");
+        EXPECT_EQ(row("MIXED"), original); // No metadata-only intermediate snapshot.
+        ready(SAI_OBJECT_TYPE_QUEUE, 400);
+        expectKeys({"MIXED"});
+        expectSnapshot("MIXED", "enabled", {SAI_OBJECT_TYPE_PORT, SAI_OBJECT_TYPE_QUEUE});
+        const auto complete = row("MIXED");
+        transitions.clear();
+        setGroup("QUEUE", "Ethernet0|0,Ethernet4|0");
+        EXPECT_TRUE(transitions.empty());
+        EXPECT_EQ(row("MIXED"), complete);
+        template_data = {1, 2, 3};
+        notify(*profile->m_sai_tam_tel_type_objs.at(SAI_OBJECT_TYPE_NULL));
+        EXPECT_EQ(row("MIXED"), complete); // Duplicate callback cannot replace it.
+    }
+
+    TEST_F(HFTelSessionOwnerTest, MixedDisableEnablePreservesCompleteMetadataAndRestartsOnce)
+    {
+        createOrch();
+        twoGroups();
+        const auto original = row("MIXED");
+        transitions.clear();
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "disabled"}}), task_success);
+        expectSnapshot("MIXED", "disabled", {SAI_OBJECT_TYPE_PORT, SAI_OBJECT_TYPE_QUEUE});
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "enabled"}}), task_success);
+        EXPECT_EQ(row("MIXED"), original);
+        expectKeys({"MIXED"});
+        ASSERT_EQ(transitions.size(), 2u);
+        EXPECT_EQ(transitions[0].second, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+        EXPECT_EQ(transitions[1].second, SAI_TAM_TEL_TYPE_STATE_START_STREAM);
+        EXPECT_EQ(transitions[0].first, transitions[1].first);
+    }
+
+    TEST_F(HFTelSessionOwnerTest, MixedDeleteGroupRegeneratesSurvivorAndLastDeleteRemovesOwner)
+    {
+        createOrch();
+        twoGroups();
+        const auto original = row("MIXED");
+        const auto oid = *profile->m_sai_tam_tel_type_objs.at(SAI_OBJECT_TYPE_NULL);
+        transitions.clear();
+        ASSERT_EQ(orch->groupTableDel(name, "PORT"), task_success);
+        EXPECT_EQ(row("MIXED"), original);
+        EXPECT_EQ(profile->getStreamState(SAI_OBJECT_TYPE_QUEUE), SAI_TAM_TEL_TYPE_STATE_CREATE_CONFIG);
+        EXPECT_EQ(*profile->m_sai_tam_tel_type_objs.at(SAI_OBJECT_TYPE_NULL), oid);
+        ASSERT_EQ(transitions.size(), 2u);
+        EXPECT_EQ(transitions[0].second, SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+        EXPECT_EQ(transitions[1].second, SAI_TAM_TEL_TYPE_STATE_CREATE_CONFIG);
+        ready(SAI_OBJECT_TYPE_QUEUE, 500);
+        expectKeys({"MIXED"});
+        expectSnapshot("MIXED", "enabled", {SAI_OBJECT_TYPE_QUEUE});
+        const auto survivor = row("MIXED");
+        transitions.clear();
+        ASSERT_EQ(orch->groupTableDel(name, "PORT"), task_success);
+        EXPECT_EQ(row("MIXED"), survivor);
+        EXPECT_TRUE(transitions.empty());
+        ASSERT_EQ(orch->groupTableDel(name, "QUEUE"), task_success);
+        expectKeys({});
+        EXPECT_TRUE(profile->m_sai_tam_tel_type_objs.empty());
+        EXPECT_TRUE(profile->m_sai_tam_report_objs.empty());
+        EXPECT_TRUE(profile->m_sai_tam_tel_type_templates.empty());
+        notify(oid); // Late callback for the removed shared hardware object.
+        expectKeys({});
+        ASSERT_EQ(orch->profileTableDel(name), task_success);
+        EXPECT_EQ(orch->tryGetProfile(name), nullptr);
+    }
+
+    TEST_F(HFTelSessionOwnerTest, MixedReconfigurationWaitsForCompleteTemplateBeforeEnable)
+    {
+        createOrch();
+        twoGroups();
+        const auto original = row("MIXED");
+        // Ethernet12 is not in the name cache yet: do not restart on old templates.
+        setGroup("PORT", "Ethernet8,Ethernet12");
+        EXPECT_EQ(row("MIXED"), original);
+        EXPECT_TRUE(profile->m_sai_tam_tel_type_templates.empty());
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "enabled"}}), task_success);
+        EXPECT_EQ(profile->getStreamState(SAI_OBJECT_TYPE_PORT), SAI_TAM_TEL_TYPE_STATE_STOP_STREAM);
+        auto disabled = original;
+        disabled["stream_status"] = "disabled";
+        EXPECT_EQ(row("MIXED"), disabled);
+        CounterNameMapUpdater::Message message;
+        message.m_table_name = COUNTERS_PORT_NAME_MAP;
+        message.m_operation = CounterNameMapUpdater::SET;
+        message.m_counter_name = "Ethernet12";
+        message.m_oid = 0x104;
+        orch->locallyNotify(message);
+        EXPECT_EQ(profile->getStreamState(SAI_OBJECT_TYPE_QUEUE), SAI_TAM_TEL_TYPE_STATE_CREATE_CONFIG);
+        ready(SAI_OBJECT_TYPE_PORT, 600);
+        expectKeys({"MIXED"});
+        expectSnapshot("MIXED", "enabled", {SAI_OBJECT_TYPE_PORT, SAI_OBJECT_TYPE_QUEUE});
+        EXPECT_NE(row("MIXED").at("object_ids"), original.at("object_ids"));
+    }
+
+    TEST_F(HFTelSessionOwnerTest, MixedReadyReconfigurationReplacesSnapshotWithoutRemovingOwner)
+    {
+        createOrch();
+        twoGroups();
+        const auto original = row("MIXED");
+        setGroup("PORT", "Ethernet8");
+        EXPECT_EQ(row("MIXED"), original);
+        expectKeys({"MIXED"});
+        EXPECT_EQ(profile->getStreamState(SAI_OBJECT_TYPE_QUEUE), SAI_TAM_TEL_TYPE_STATE_CREATE_CONFIG);
+        EXPECT_EQ(orch->profileTableSet(name, {{"stream_state", "disabled"}}), task_need_retry);
+        ready(SAI_OBJECT_TYPE_PORT, 600);
+        expectSnapshot("MIXED", "enabled", {SAI_OBJECT_TYPE_PORT, SAI_OBJECT_TYPE_QUEUE});
+        expectKeys({"MIXED"});
+        EXPECT_NE(row("MIXED").at("session_config"), original.at("session_config"));
+    }
+
+    TEST_F(HFTelSessionOwnerTest, MixedDisabledGroupDeletionPublishesDisabledReplacement)
+    {
+        createOrch();
+        twoGroups();
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "disabled"}}), task_success);
+        ASSERT_EQ(orch->groupTableDel(name, "QUEUE"), task_success);
+        ready(SAI_OBJECT_TYPE_PORT, 500);
+        expectSnapshot("MIXED", "disabled", {SAI_OBJECT_TYPE_PORT});
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "enabled"}}), task_success);
+        expectSnapshot("MIXED", "enabled", {SAI_OBJECT_TYPE_PORT});
+        expectKeys({"MIXED"});
+    }
+
+    TEST_F(HFTelSessionOwnerTest, SingleKeepsIndependentGroupRowsAndLifecycle)
+    {
+        createOrch(false);
+        setGroup("PORT", "Ethernet0,Ethernet4");
+        ready(SAI_OBJECT_TYPE_PORT);
+        expectSnapshot("PORT", "enabled", {SAI_OBJECT_TYPE_PORT});
+        const auto port = row("PORT");
+        setGroup("QUEUE", "Ethernet0|0,Ethernet4|0");
+        ready(SAI_OBJECT_TYPE_QUEUE, 400);
+        expectSnapshot("QUEUE", "enabled", {SAI_OBJECT_TYPE_QUEUE});
+        expectKeys({"PORT", "QUEUE"});
+        EXPECT_EQ(row("PORT"), port);
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "disabled"}}), task_success);
+        EXPECT_EQ(row("PORT").at("stream_status"), "disabled");
+        EXPECT_EQ(row("QUEUE").at("stream_status"), "disabled");
+        ASSERT_EQ(orch->profileTableSet(name, {{"stream_state", "enabled"}}), task_success);
+        EXPECT_EQ(row("PORT"), port);
+        const auto queue = row("QUEUE");
+        ASSERT_EQ(orch->groupTableDel(name, "PORT"), task_success);
+        EXPECT_EQ(row("QUEUE"), queue);
+        EXPECT_EQ(profile->getStreamState(SAI_OBJECT_TYPE_QUEUE), SAI_TAM_TEL_TYPE_STATE_START_STREAM);
+        expectKeys({"QUEUE"});
+        ASSERT_EQ(orch->groupTableDel(name, "QUEUE"), task_success);
+        expectKeys({});
     }
 
     /*

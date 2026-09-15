@@ -421,6 +421,8 @@ namespace hftelprofile_ut
                     decay_t<decltype(p->m_sai_tam_tel_type_objs)>();
                 new (&p->m_sai_tam_tel_type_states)
                     decay_t<decltype(p->m_sai_tam_tel_type_states)>();
+                new (&p->m_sai_tam_tel_type_templates)
+                    decay_t<decltype(p->m_sai_tam_tel_type_templates)>();
             }
 
             ~StreamingMutationStub()
@@ -438,6 +440,7 @@ namespace hftelprofile_ut
                 p->m_sai_tam_counter_subscription_objs.~CounterSubscriptionObjs();
                 p->m_sai_tam_tel_type_objs.~TelTypeObjs();
                 p->m_sai_tam_tel_type_states.~TelTypeStates();
+                p->m_sai_tam_tel_type_templates.~unordered_map();
                 p = nullptr;
             }
         };
@@ -483,7 +486,7 @@ namespace hftelprofile_ut
         ASSERT_EQ(s.p->getStreamState(SAI_OBJECT_TYPE_PORT), SAI_TAM_TEL_TYPE_STATE_START_STREAM);
         ASSERT_EQ(s.p->getStreamState(SAI_OBJECT_TYPE_QUEUE), SAI_TAM_TEL_TYPE_STATE_START_STREAM);
 
-        s.p->setStatsIDs("queue", {"SAI_QUEUE_STAT_PACKETS"});
+        s.p->setStatsIDs("queue", {"PACKETS"});
 
         // QUEUE was the only group mutated, but PORT's queryable state moves
         // too: both map onto the same shared tel_type in MIXED mode.
@@ -542,7 +545,7 @@ namespace hftelprofile_ut
         s.p->m_sai_tam_tel_type_states[port_guard] = SAI_TAM_TEL_TYPE_STATE_START_STREAM;
         s.p->m_sai_tam_tel_type_states[queue_guard] = SAI_TAM_TEL_TYPE_STATE_START_STREAM;
 
-        s.p->setStatsIDs("queue", {"SAI_QUEUE_STAT_PACKETS"});
+        s.p->setStatsIDs("queue", {"PACKETS"});
 
         // Each object type owns its own tel_type in SINGLE mode, so mutating
         // QUEUE must not disturb PORT.
@@ -717,7 +720,7 @@ namespace hftelprofile_ut
                 new (&p->m_sai_tam_tel_type_objs) decay_t<decltype(p->m_sai_tam_tel_type_objs)>();
                 new (&p->m_sai_tam_tel_type_states) decay_t<decltype(p->m_sai_tam_tel_type_states)>();
                 new (&p->m_sai_tam_report_objs) decay_t<decltype(p->m_sai_tam_report_objs)>();
-                p->m_sai_tam_telemetry_obj = make_shared<sai_object_id_t>(0x900);
+                new (&p->m_sai_tam_telemetry_obj) HFTelProfile::sai_guard_t(make_shared<sai_object_id_t>(0x900));
             }
 
             ~TelTypeStub()
@@ -728,6 +731,7 @@ namespace hftelprofile_ut
                 p->m_sai_tam_tel_type_states.~unordered_map();
                 p->m_sai_tam_report_objs.~unordered_map();
                 p->m_sai_tam_telemetry_obj.~shared_ptr();
+                p->m_tel_type_supported_categories.~unordered_set();
                 p = nullptr;
             }
         };
@@ -767,7 +771,7 @@ namespace hftelprofile_ut
 
         // TAM_TELEMETRY's SAI_TAM_TELEMETRY_ATTR_TAM_TYPE_LIST bookkeeping, exercised
         // by HFTELUTILS_ADD_SAI_OBJECT_LIST inside getTAMTelTypeObjID.
-        static sai_status_t mock_get_tam_attribute(
+        static sai_status_t mock_get_tam_telemetry_attribute(
             sai_object_id_t /*tam_id*/,
             uint32_t /*attr_count*/,
             sai_attribute_t *attr_list)
@@ -776,7 +780,7 @@ namespace hftelprofile_ut
             return SAI_STATUS_SUCCESS;
         }
 
-        static sai_status_t mock_set_tam_attribute(
+        static sai_status_t mock_set_tam_telemetry_attribute(
             sai_object_id_t /*tam_id*/,
             const sai_attribute_t * /*attr*/)
         {
@@ -796,8 +800,8 @@ namespace hftelprofile_ut
             ut_api.remove_tam_tel_type = mock_remove_tam_tel_type;
             ut_api.create_tam_report = mock_create_tam_report;
             ut_api.remove_tam_report = mock_remove_tam_report;
-            ut_api.get_tam_attribute = mock_get_tam_attribute;
-            ut_api.set_tam_attribute = mock_set_tam_attribute;
+            ut_api.get_tam_telemetry_attribute = mock_get_tam_telemetry_attribute;
+            ut_api.set_tam_telemetry_attribute = mock_set_tam_telemetry_attribute;
             sai_tam_api = &ut_api;
             tel_type_attrs.clear();
         }

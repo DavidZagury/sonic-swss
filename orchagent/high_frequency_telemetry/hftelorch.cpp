@@ -12,8 +12,6 @@
 
 #include <yaml-cpp/yaml.h>
 #include <boost/algorithm/string/join.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/lexical_cast.hpp>
 
 #include <algorithm>
 
@@ -446,15 +444,9 @@ task_process_status HFTelOrch::profileTableSet(const string &profile_name, const
         // The entry is created/updated in doTask(NotificationConsumer&) when TAM notifies config readiness.
         // Here we only update existing entries to avoid creating partial/incomplete state entries.
         const auto desired_stream_status = (state == SAI_TAM_TEL_TYPE_STATE_START_STREAM) ? "enabled" : "disabled";
-        for (const auto &type_profiles : m_type_profile_mapping)
+        for (const auto type : profile->getObjectTypes())
         {
-            const auto &type = type_profiles.first;
-            if (type_profiles.second.find(profile) == type_profiles.second.end())
-            {
-                continue;
-            }
-
-            const auto session_key = profile_name + "|" + HFTelUtils::sai_type_to_group_name(type);
+            const auto session_key = profile->getSessionKey(type);
             vector<FieldValueTuple> existing_values;
             if (!m_state_telemetry_session.get(session_key, existing_values))
             {
@@ -462,8 +454,15 @@ task_process_status HFTelOrch::profileTableSet(const string &profile_name, const
             }
 
             vector<FieldValueTuple> update_values;
-            update_values.emplace_back("stream_status", desired_stream_status);
+            // MIXED may be waiting for objects/templates after a reconfiguration.
+            update_values.emplace_back("stream_status", profile->isMixedTypeMode()
+                ? (profile->getStreamState(type) == SAI_TAM_TEL_TYPE_STATE_START_STREAM ? "enabled" : "disabled")
+                : desired_stream_status);
             m_state_telemetry_session.set(session_key, update_values);
+            if (profile->isMixedTypeMode())
+            {
+                break;
+            }
         }
     }
 
@@ -594,9 +593,23 @@ task_process_status HFTelOrch::groupTableDel(const std::string &profile_name, co
         return task_process_status::task_need_retry;
     }
 
+    const auto object_types = profile->getObjectTypes();
+    const bool had_group = find(object_types.begin(), object_types.end(), type) != object_types.end();
     profile->clearGroup(group_name);
     m_type_profile_mapping[type].erase(profile);
-    m_state_telemetry_session.del(profile_name + "|" + HFTelUtils::sai_type_to_group_name(type));
+    if (!profile->isMixedTypeMode() || profile->isEmpty())
+    {
+        m_state_telemetry_session.del(profile->getSessionKey(type));
+    }
+    else if (had_group)
+    {
+        // Keep the last complete snapshot until the replacement is ready. Deleting
+        // the shared owner here would discard countersyncd's active/pending state.
+        for (const auto remaining_type : profile->getObjectTypes())
+        {
+            profile->tryCommitConfig(remaining_type);
+        }
+    }
 
     SWSS_LOG_NOTICE("The high frequency telemetry group %s with profile %s is deleted", group_name.c_str(), profile_name.c_str());
 
@@ -695,25 +708,17 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
 
         auto type = profile.second->getObjectType(tam_tel_type_obj);
 
+        if (profile.second->isMixedTypeMode() &&
+            profile.second->getStreamState(type) != SAI_TAM_TEL_TYPE_STATE_CREATE_CONFIG)
+        {
+            // Ignore late/duplicate callbacks rather than pair old templates with
+            // metadata from a configuration that has not been committed yet.
+            return;
+        }
+
         // TODO: A potential optimization
         // We need to notify Config Ready only when the message of State DB is delivered to the CounterSyncd
         profile.second->notifyConfigReady(type);
-
-        // In SINGLE mode SAI fires this callback once per object type, so we
-        // write the matching per-group STATE_DB entry. In MIXED mode the
-        // callback fires once per profile with the single tel_type oid, so
-        // we replicate the same combined IPFIX template into every per-group
-        // entry the profile owns. CounterSyncd reads per-group session_config
-        // unchanged.
-        vector<sai_object_type_t> session_types;
-        if (profile.second->isMixedTypeMode())
-        {
-            session_types = profile.second->getObjectTypes();
-        }
-        else
-        {
-            session_types.push_back(type);
-        }
 
         auto state = profile.second->getTelemetryTypeState(type);
         string stream_status;
@@ -730,29 +735,20 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
             SWSS_LOG_THROW("Unexpected state %d for high frequency telemetry", state);
         }
 
-        auto templates = profile.second->getTemplates(type);
-        auto to_string = boost::adaptors::transformed([](sai_uint16_t n)
-                                                        { return boost::lexical_cast<std::string>(n); });
+        const auto &templates = profile.second->getTemplates(type);
+        const auto names_and_labels = profile.second->getObjectNamesAndLabels(type);
+        const auto session_key = profile.second->getSessionKey(type);
+        vector<FieldValueTuple> session_values;
+        session_values.emplace_back("stream_status", stream_status);
+        session_values.emplace_back("object_names", boost::algorithm::join(names_and_labels.first, ","));
+        session_values.emplace_back("object_ids", boost::algorithm::join(names_and_labels.second, ","));
+        session_values.emplace_back("session_type", "ipfix");
+        session_values.emplace_back("session_config", string(templates.begin(), templates.end()));
 
-        for (auto session_type : session_types)
-        {
-            vector<FieldValueTuple> values;
-            values.emplace_back("stream_status", stream_status);
-            values.emplace_back("object_names",
-                                boost::algorithm::join(profile.second->getObjectNames(session_type), ","));
-            values.emplace_back("object_ids",
-                                boost::algorithm::join(profile.second->getObjectLabels(session_type) | to_string, ","));
-            values.emplace_back("session_type", "ipfix");
-            values.emplace_back("session_config", string(templates.begin(), templates.end()));
-
-            m_state_telemetry_session.set(
-                profile.first + "|" + HFTelUtils::sai_type_to_group_name(session_type),
-                values);
-
-            SWSS_LOG_NOTICE("The high frequency telemetry group %s with profile %s is ready",
-                            HFTelUtils::sai_type_to_group_name(session_type).c_str(),
-                            profile.first.c_str());
-        }
+        // One atomic, complete snapshot per hardware stream, including all labels
+        // needed by countersyncd's template compiler at installation time.
+        m_state_telemetry_session.set(session_key, session_values);
+        SWSS_LOG_NOTICE("The high frequency telemetry session %s is ready", session_key.c_str());
 
         return;
     }
