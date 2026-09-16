@@ -734,14 +734,33 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
         auto to_string = boost::adaptors::transformed([](sai_uint16_t n)
                                                         { return boost::lexical_cast<std::string>(n); });
 
+        // In MIXED mode every per-group session registers the same
+        // template_id (the same combined template above). CounterSyncd
+        // requires each session's own object_names/object_ids to resolve
+        // every field in whatever template it registers - not just that
+        // group's own objects - or the shared template_id collides/fails
+        // validation. Compute the profile-wide union once and write the
+        // same union into every session. In SINGLE mode session_types has
+        // exactly one entry, so this collapses to that type's own objects,
+        // unchanged from today.
+        vector<string> object_names;
+        vector<string> object_labels;
+        for (auto session_type : session_types)
+        {
+            auto names = profile.second->getObjectNames(session_type);
+            object_names.insert(object_names.end(), names.begin(), names.end());
+            auto labels = profile.second->getObjectLabels(session_type) | to_string;
+            object_labels.insert(object_labels.end(), labels.begin(), labels.end());
+        }
+        auto joined_object_names = boost::algorithm::join(object_names, ",");
+        auto joined_object_labels = boost::algorithm::join(object_labels, ",");
+
         for (auto session_type : session_types)
         {
             vector<FieldValueTuple> values;
             values.emplace_back("stream_status", stream_status);
-            values.emplace_back("object_names",
-                                boost::algorithm::join(profile.second->getObjectNames(session_type), ","));
-            values.emplace_back("object_ids",
-                                boost::algorithm::join(profile.second->getObjectLabels(session_type) | to_string, ","));
+            values.emplace_back("object_names", joined_object_names);
+            values.emplace_back("object_ids", joined_object_labels);
             values.emplace_back("session_type", "ipfix");
             values.emplace_back("session_config", string(templates.begin(), templates.end()));
 
