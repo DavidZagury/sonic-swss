@@ -99,11 +99,33 @@ impl ObservationTime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompiledTemplate {
     key: TemplateKey,
-    owner: Arc<str>,
     observation_time: ObservationTime,
     counters: Arc<[CompiledCounter]>,
     metadata: Arc<[SAIStatMetadata]>,
     record_len: usize,
+}
+
+/// A template installed and shared by one or more owners (STATE_DB session
+/// keys). Multiple owners may share one entry only when their compiled
+/// templates are byte-identical, verified at registration in
+/// `IpfixActor::handle_template` - this happens in HFT MIXED mode, where
+/// several per-group sessions register the same combined template. The
+/// entry is evicted from `installed` once its owner set becomes empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledTemplate {
+    template: Arc<CompiledTemplate>,
+    owners: HashSet<Arc<str>>,
+}
+
+// Lets existing call sites read compiled-template fields directly through an
+// installed entry (e.g. `installed[key].record_len`), same as when
+// `installed` held `Arc<CompiledTemplate>` directly.
+impl std::ops::Deref for InstalledTemplate {
+    type Target = CompiledTemplate;
+
+    fn deref(&self) -> &CompiledTemplate {
+        &self.template
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,7 +207,7 @@ pub struct IpfixActor {
     template_recipient: Receiver<IPFixTemplatesMessage>,
     record_recipient: Receiver<SocketBufferMessage>,
     sessions: HashMap<Arc<str>, SessionTemplates>,
-    installed: HashMap<TemplateKey, Arc<CompiledTemplate>>,
+    installed: HashMap<TemplateKey, InstalledTemplate>,
     last_observation_time: Option<u64>,
     dropped_sets: u64,
     next_drop_warning: Instant,
@@ -258,7 +280,6 @@ impl IpfixActor {
             }
         }
 
-        let owner = Arc::<str>::from(templates.key.as_str());
         let mut compiled = HashMap::new();
         for message in IpfixMessages::new(bytes) {
             let message = message?;
@@ -275,7 +296,7 @@ impl IpfixActor {
                     )
                     .into());
                 }
-                compile_template_set(set, domain, &owner, &object_names, &mut compiled)?;
+                compile_template_set(set, domain, &object_names, &mut compiled)?;
             }
         }
         if compiled.is_empty() {
@@ -288,8 +309,16 @@ impl IpfixActor {
 
     fn remove_session(&mut self, owner: &str) {
         self.sessions.remove(owner);
-        self.installed
-            .retain(|_, template| template.owner.as_ref() != owner);
+        self.drop_owner_from_installed(owner);
+    }
+
+    /// Removes `owner`'s claim on every installed template, evicting an
+    /// entry entirely once no owner remains registered for it.
+    fn drop_owner_from_installed(&mut self, owner: &str) {
+        self.installed.retain(|_, installed| {
+            installed.owners.remove(owner);
+            !installed.owners.is_empty()
+        });
     }
 
     fn handle_template(&mut self, update: IPFixTemplatesMessage) -> Result<(), IpfixError> {
@@ -309,29 +338,26 @@ impl IpfixActor {
                 return Err(err);
             }
         };
+        let owner: Arc<str> = Arc::<str>::from(update.key.as_str());
         // Check the entire candidate before changing any installed/session state.
         // Conflicts, unlike compile errors, must preserve both owners' snapshots.
+        // A different owner may share an installed template only when the
+        // compiled content is byte-identical (HFT MIXED mode: several
+        // per-group sessions legitimately register the same combined
+        // template); anything else is a genuine collision.
         for (key, template) in &mut generation.templates {
             if let Some(installed) = self.installed.get(key) {
-                if installed.as_ref() != template.as_ref() {
+                if installed.template.as_ref() != template.as_ref() {
                     return Err(format!(
-                        "template collision at {key:?}: incoming owner {:?}, existing owner {:?}; different schema or owner",
-                        update.key, installed.owner
+                        "template collision at {key:?}: incoming owner {:?}, existing owner(s) {:?}; different schema",
+                        update.key, installed.owners
                     )
                     .into());
                 }
                 // Shared keys have one decoder/allocation across both generations.
-                *template = Arc::clone(installed);
+                *template = Arc::clone(&installed.template);
             }
         }
-        let owner = Arc::clone(
-            &generation
-                .templates
-                .values()
-                .next()
-                .expect("nonempty generation")
-                .owner,
-        );
         let session = match self.sessions.get(update.key.as_str()) {
             Some(previous) => SessionTemplates {
                 active: previous.active.clone(),
@@ -344,39 +370,60 @@ impl IpfixActor {
         };
 
         // Keep active plus the latest pending snapshot, never historical pending keys.
-        self.installed
-            .retain(|_, template| template.owner.as_ref() != update.key);
+        self.drop_owner_from_installed(&owner);
         for generation in std::iter::once(&session.active).chain(session.pending.iter()) {
-            self.installed.extend(
-                generation
-                    .templates
-                    .iter()
-                    .map(|(key, template)| (*key, Arc::clone(template))),
-            );
+            for (key, template) in &generation.templates {
+                self.installed
+                    .entry(*key)
+                    .or_insert_with(|| InstalledTemplate {
+                        template: Arc::clone(template),
+                        owners: HashSet::new(),
+                    })
+                    .owners
+                    .insert(Arc::clone(&owner));
+            }
         }
         self.sessions.insert(owner, session);
         Ok(())
     }
 
-    fn promote_pending_for(&mut self, template: &CompiledTemplate) {
-        let session = self
-            .sessions
-            .get_mut(template.owner.as_ref())
-            .expect("installed owner");
-        let Some(pending) = &session.pending else {
+    /// Promotes `key`'s pending generation to active for every owner sharing
+    /// the installed template at that key, once incoming data proves the
+    /// pending generation is live.
+    fn promote_pending_for(&mut self, key: &TemplateKey) {
+        let Some(owners) = self.installed.get(key).map(|installed| installed.owners.clone())
+        else {
             return;
         };
-        if !pending.templates.contains_key(&template.key)
-            || session.active.templates.contains_key(&template.key)
-        {
-            return;
-        }
-        for key in session.active.templates.keys() {
-            if !pending.templates.contains_key(key) {
-                self.installed.remove(key);
+        for owner in owners {
+            let Some(session) = self.sessions.get(owner.as_ref()) else {
+                continue;
+            };
+            let Some(pending) = &session.pending else {
+                continue;
+            };
+            if !pending.templates.contains_key(key) || session.active.templates.contains_key(key)
+            {
+                continue;
             }
+            let stale_keys: Vec<TemplateKey> = session
+                .active
+                .templates
+                .keys()
+                .filter(|k| !pending.templates.contains_key(k))
+                .copied()
+                .collect();
+            for stale_key in stale_keys {
+                if let Some(installed) = self.installed.get_mut(&stale_key) {
+                    installed.owners.remove(owner.as_ref());
+                    if installed.owners.is_empty() {
+                        self.installed.remove(&stale_key);
+                    }
+                }
+            }
+            let session = self.sessions.get_mut(owner.as_ref()).expect("session exists");
+            session.active = session.pending.take().expect("pending generation");
         }
-        session.active = session.pending.take().expect("pending generation");
     }
 
     #[cfg(test)]
@@ -438,8 +485,9 @@ impl IpfixActor {
             let decoder = self
                 .installed
                 .get(&key)
-                .map(|template| {
-                    validate_data_set(template, set).map(|layout| (Arc::clone(template), layout))
+                .map(|installed| {
+                    validate_data_set(&installed.template, set)
+                        .map(|layout| (Arc::clone(&installed.template), layout))
                 })
                 .transpose()?;
             if let Some((_, layout)) = &decoder {
@@ -477,9 +525,9 @@ impl IpfixActor {
                 if self
                     .installed
                     .get(&set.key)
-                    .is_some_and(|installed| Arc::ptr_eq(installed, template))
+                    .is_some_and(|installed| Arc::ptr_eq(&installed.template, template))
                 {
-                    self.promote_pending_for(template);
+                    self.promote_pending_for(&set.key);
                     let end = SET_HEADER_LEN + layout.record_bytes;
                     if let Some(time) = template
                         .observation_time
@@ -807,7 +855,6 @@ fn read_be_u64(bytes: &[u8]) -> u64 {
 fn compile_template_set(
     set: &[u8],
     domain: u32,
-    owner: &Arc<str>,
     object_names: &HashMap<u16, Arc<str>>,
     output: &mut HashMap<TemplateKey, Arc<CompiledTemplate>>,
 ) -> Result<(), IpfixError> {
@@ -937,7 +984,6 @@ fn compile_template_set(
         };
         let template = Arc::new(CompiledTemplate {
             key,
-            owner: Arc::clone(owner),
             observation_time,
             metadata: counters.iter().map(|counter|SAIStatMetadata::new(counter.object_name.clone(),counter.type_id,counter.stat_id)).collect::<Vec<_>>().into(),
             counters: counters.into(),
@@ -2504,13 +2550,13 @@ mod tests {
                 .to_string();
             assert!(error.contains("collision"));
             assert!(error.contains(&format!("incoming owner {owner:?}")));
-            assert!(error.contains(&format!("existing owner {incumbent:?}")));
+            assert!(error.contains(&format!("existing owner(s) {{{incumbent:?}}}")));
             assert!(error.contains(&format!("template_id: {id}")));
             assert!(error.contains("observation_domain_id: 7"));
             assert_eq!(actor.sessions, sessions);
             assert_eq!(actor.installed, installed);
             for (key, template) in &installed {
-                assert!(Arc::ptr_eq(&actor.installed[key], template));
+                assert!(Arc::ptr_eq(&actor.installed[key].template, &template.template));
             }
         }
         let batch = actor
@@ -2521,6 +2567,84 @@ mod tests {
             .unwrap();
         assert_eq!(batch.record_count(), 2);
         assert_eq!(actor.sessions, sessions);
+    }
+
+    #[test]
+    fn identical_schema_from_different_owners_shares_installed_template() {
+        // Models HFT MIXED mode: several per-group STATE_DB sessions (here,
+        // "port" and "queue") all register the exact same combined template
+        // at one template_id, because the orchagent replicates one combined
+        // IPFIX template into every per-group session entry. Two different
+        // owners registering byte-identical content must share the
+        // installed template rather than collide.
+        let mut actor = actor();
+        actor
+            .handle_template(snapshot("port", &[(0, 300, 1)]))
+            .unwrap();
+        actor
+            .handle_template(snapshot("queue", &[(0, 300, 1)]))
+            .unwrap();
+
+        assert_eq!(actor.sessions.len(), 2);
+        assert_eq!(actor.installed.len(), 1);
+        let key = TemplateKey {
+            observation_domain_id: 0,
+            template_id: 300,
+        };
+        let installed = &actor.installed[&key];
+        assert_eq!(installed.owners.len(), 2);
+        assert!(installed.owners.contains("port"));
+        assert!(installed.owners.contains("queue"));
+
+        // Either owner's registration resolves data for the shared template_id.
+        let batch = actor
+            .handle_record(&data_message(0, &[(300, vec![(1, vec![42])])]))
+            .unwrap();
+        assert_eq!(batch.iter().next().unwrap().stats.get(0).unwrap().stat_id, 1);
+    }
+
+    #[test]
+    fn removing_one_shared_owner_preserves_the_others_data() {
+        // Continuation of identical_schema_from_different_owners_shares_installed_template:
+        // removing one owner's session (e.g. a per-group session torn down or
+        // reconfigured) must not disturb the other owner still sharing the
+        // installed template.
+        let mut actor = actor();
+        actor
+            .handle_template(snapshot("port", &[(0, 300, 1)]))
+            .unwrap();
+        actor
+            .handle_template(snapshot("queue", &[(0, 300, 1)]))
+            .unwrap();
+
+        actor
+            .handle_template(IPFixTemplatesMessage::delete("port".into()))
+            .unwrap();
+
+        assert_eq!(actor.sessions.len(), 1);
+        let key = TemplateKey {
+            observation_domain_id: 0,
+            template_id: 300,
+        };
+        // The installed template survives - "queue" still owns it.
+        let installed = &actor.installed[&key];
+        assert_eq!(installed.owners.len(), 1);
+        assert!(installed.owners.contains("queue"));
+
+        let batch = actor
+            .handle_record(&data_message(0, &[(300, vec![(1, vec![42])])]))
+            .unwrap();
+        assert_eq!(batch.iter().next().unwrap().stats.get(0).unwrap().stat_id, 1);
+
+        // Removing the last owner evicts the installed entry entirely.
+        actor
+            .handle_template(IPFixTemplatesMessage::delete("queue".into()))
+            .unwrap();
+        assert!(actor.installed.is_empty());
+        assert!(actor
+            .handle_record(&data_message(0, &[(300, vec![(1, vec![42])])]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
