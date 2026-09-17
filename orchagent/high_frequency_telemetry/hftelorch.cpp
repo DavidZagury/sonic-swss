@@ -749,7 +749,13 @@ void HFTelOrch::doTask(swss::NotificationConsumer &consumer)
         {
             auto names = profile.second->getObjectNames(session_type);
             object_names.insert(object_names.end(), names.begin(), names.end());
-            auto labels = profile.second->getObjectLabels(session_type) | to_string;
+            // getObjectLabels() returns by value; bind it to a named variable
+            // before piping into the transformed view. Piping the temporary
+            // directly leaves the view referencing already-destroyed memory
+            // once the full expression ends, since boost::adaptors::transformed
+            // does not extend the lifetime of its source range.
+            auto raw_labels = profile.second->getObjectLabels(session_type);
+            auto labels = raw_labels | to_string;
             object_labels.insert(object_labels.end(), labels.begin(), labels.end());
         }
         auto joined_object_names = boost::algorithm::join(object_names, ",");
